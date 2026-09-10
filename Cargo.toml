@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["tracel-deploy", "tracel-deploy-macros"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+repository = "https://github.com/ZIDOUZI/tracel-deploy"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+tracel-xtask = "3.0"

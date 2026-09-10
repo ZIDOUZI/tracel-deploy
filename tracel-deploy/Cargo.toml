@@ -1,0 +1,16 @@
+[package]
+name = "tracel-deploy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Composable deployment and running-binary rotation helpers for tracel-xtask"
+keywords = ["xtask", "deploy", "cargo", "release", "rotate"]
+categories = ["development-tools"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tracel-deploy-macros = { version = "0.1.0", path = "../tracel-deploy-macros" }
+tracel-xtask.workspace = true
