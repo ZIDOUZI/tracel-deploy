@@ -165,7 +165,7 @@ fn cleanup_backups_with<F>(
             metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
         ));
     }
-    backups.sort_by(|left, right| right.1.cmp(&left.1));
+    backups.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
     for (index, (path, modified)) in backups.iter().enumerate() {
         let over_retention = backup_retention.is_some_and(|keep| index >= keep);
         let too_old = backup_max_age.is_some_and(|max_age| match now.duration_since(*modified) {
@@ -283,7 +283,12 @@ fn set_executable(_path: &Path) -> io::Result<()> {
 fn is_running_binary_error(error: &io::Error) -> bool {
     #[cfg(windows)]
     {
-        matches!(error.raw_os_error(), Some(5 | 32 | 33))
+        // 5: ERROR_ACCESS_DENIED, 32: ERROR_SHARING_VIOLATION,
+        // 33: ERROR_LOCK_VIOLATION, 1224: ERROR_USER_MAPPED_FILE.
+        const RUNNING_BINARY_ERRORS: [i32; 4] = [5, 32, 33, 1224];
+        error
+            .raw_os_error()
+            .is_some_and(|code| RUNNING_BINARY_ERRORS.contains(&code))
     }
     #[cfg(not(windows))]
     {
@@ -630,5 +635,80 @@ mod tests {
 
         assert_eq!(backup_names(&dir).len(), 1);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn running_binary_error_classification() {
+        use std::io::Error;
+
+        for code in [5, 32, 33, 1224] {
+            let error = Error::from_raw_os_error(code);
+            assert!(
+                super::is_running_binary_error(&error),
+                "code {code} must be treated as a running-binary error"
+            );
+        }
+        let other = Error::from_raw_os_error(2);
+        assert!(!super::is_running_binary_error(&other));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replaces_a_running_binary() {
+        let dir = temp_dir("running-binary");
+        let holder = dir.join("holder.exe");
+        let executable = std::env::current_exe().expect("current test executable");
+        fs::copy(&executable, &holder).expect("stage holder copy");
+
+        let mut child = std::process::Command::new(&holder)
+            .args([
+                "--exact",
+                "rotate::tests::hold_binary_alive_for_rotate",
+                "--ignored",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the running binary");
+        std::thread::sleep(Duration::from_millis(500));
+
+        let source = dir.join("replacement.exe");
+        fs::write(&source, "replacement").expect("write replacement");
+        let outcome = rotate(&RotateOptions {
+            source,
+            destination: holder.clone(),
+            backup_dir: None,
+            strategy: RotateStrategy::Auto,
+            dry_run: false,
+            ..RotateOptions::default()
+        })
+        .expect("rotate a running binary");
+
+        assert!(
+            matches!(outcome, RotateOutcome::ReplacedAfterRename { .. }),
+            "outcome: {outcome:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&holder).expect("read replacement"),
+            "replacement"
+        );
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "the running process must keep running"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Helper for the running-binary test: keeps the copied executable alive
+    /// so the rotation has to move a running image out of the way.
+    #[test]
+    #[ignore]
+    fn hold_binary_alive_for_rotate() {
+        std::thread::sleep(Duration::from_secs(30));
     }
 }

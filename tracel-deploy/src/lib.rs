@@ -21,7 +21,10 @@ pub mod plan;
 pub mod rotate;
 
 pub use command::DeployCmdArgs;
-pub use context::{DeployContext, Profile};
+pub use context::{
+    DeployContext, DeployContextBuilder, DeployLock, FileFingerprint, Profile, content_matches,
+    file_fingerprint,
+};
 pub use plan::{
     CargoBuildStep, DeployBuilder, DeployHook, DeployHookEntry, DeployHookReport, DeployPlan,
     DeployReport, DeployStep, DeployStepReport, RotateStep, RunStep, StepStatus, deploy,
@@ -37,9 +40,10 @@ pub mod __private {
 
 pub mod prelude {
     pub use crate::{
-        CargoBuildStep, DeployBuilder, DeployCmdArgs, DeployContext, DeployHook, DeployHookEntry,
-        DeployHookReport, DeployPlan, DeployReport, DeployStep, DeployStepReport, Profile,
-        RotateOptions, RotateOutcome, RotateStep, RotateStrategy, RunStep, StepStatus, deploy,
+        CargoBuildStep, DeployBuilder, DeployCmdArgs, DeployContext, DeployContextBuilder,
+        DeployHook, DeployHookEntry, DeployHookReport, DeployLock, DeployPlan, DeployReport,
+        DeployStep, DeployStepReport, FileFingerprint, Profile, RotateOptions, RotateOutcome,
+        RotateStep, RotateStrategy, RunStep, StepStatus, content_matches, deploy, file_fingerprint,
         rotate,
     };
     pub use tracel_deploy_macros::deploy_commands;

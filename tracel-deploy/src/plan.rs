@@ -1,13 +1,15 @@
 use std::{
+    fs,
     io::Read,
     path::PathBuf,
     process::{Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result};
 
 use crate::{
-    context::DeployContext,
+    context::{DeployContext, DeployLock, content_matches, file_fingerprint},
     rotate::{RotateOptions, RotateOutcome, RotateStrategy, rotate},
 };
 
@@ -190,6 +192,8 @@ pub struct DeployBuilder<'a> {
     context: &'a DeployContext,
     plan: DeployPlan,
     defaults: bool,
+    insert_after_build: Vec<DeployStep>,
+    insert_before_rotate: Vec<DeployStep>,
 }
 
 impl<'a> DeployBuilder<'a> {
@@ -198,6 +202,8 @@ impl<'a> DeployBuilder<'a> {
             context,
             plan: DeployPlan::new(),
             defaults: true,
+            insert_after_build: Vec::new(),
+            insert_before_rotate: Vec::new(),
         }
     }
 
@@ -298,6 +304,27 @@ impl<'a> DeployBuilder<'a> {
         self
     }
 
+    /// Insert a step between the default cargo build and the default rotation.
+    ///
+    /// The classic use case is `build -> stop service -> rotate -> start
+    /// service`: stopping a service in a `pre` hook would stop it before the
+    /// build, so a failed build keeps the service down unnecessarily.
+    pub fn insert_after_default_build(mut self, step: DeployStep) -> Self {
+        self.insert_after_build.push(step);
+        self
+    }
+
+    /// Insert a step between the default cargo build and the default rotation.
+    ///
+    /// Steps inserted here run in the order they were added. When several
+    /// steps are inserted with both methods, all
+    /// [`insert_after_default_build`](Self::insert_after_default_build) steps
+    /// run first.
+    pub fn insert_before_default_rotate(mut self, step: DeployStep) -> Self {
+        self.insert_before_rotate.push(step);
+        self
+    }
+
     /// Replace the default cargo-build + rotate plan with exactly the steps
     /// added by the caller.
     pub fn without_defaults(mut self) -> Self {
@@ -308,11 +335,162 @@ impl<'a> DeployBuilder<'a> {
     pub fn run(mut self) -> Result<DeployReport> {
         if self.defaults {
             let mut steps = DeployPlan::standard(self.context);
+            let rotate = steps
+                .pop()
+                .expect("the standard plan always contains a rotation step");
+            steps.append(&mut self.insert_after_build);
+            steps.append(&mut self.insert_before_rotate);
+            steps.push(rotate);
             steps.append(&mut self.plan.steps);
             self.plan.steps = steps;
         }
-        self.plan.run(self.context)
+        let context = self.context;
+        let _lock = if context.dry_run {
+            None
+        } else {
+            Some(DeployLock::acquire(
+                &context.state_dir,
+                &context.binary_name,
+            )?)
+        };
+        if self.defaults
+            && !context.dry_run
+            && let Some(report) = skip_current_report(context)?
+        {
+            return Ok(report);
+        }
+        let report = self.plan.run(context)?;
+        if self.defaults && !context.dry_run {
+            verify_install(context)?;
+            if let Err(error) = write_deploy_stamp(context) {
+                eprintln!("warning: deployed, but the deployment stamp was not written: {error:#}");
+            }
+        }
+        Ok(report)
     }
+}
+
+/// When the installed binary already matches the built source and `force` is
+/// not set, the default plan is skipped without touching the destination.
+fn skip_current_report(context: &DeployContext) -> Result<Option<DeployReport>> {
+    let source = context.built_binary_path();
+    let destination = &context.install_path;
+    if !source.is_file() || !destination.is_file() {
+        return Ok(None);
+    }
+    let matches = content_matches(&source, destination).with_context(|| {
+        format!(
+            "could not compare {} with {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    if !matches {
+        return Ok(None);
+    }
+    if context.force {
+        return Ok(None);
+    }
+    if !context.quiet {
+        println!(
+            "skipping deploy: {} already matches {} (use --force to deploy anyway)",
+            destination.display(),
+            source.display()
+        );
+    }
+    Ok(Some(DeployReport {
+        installed: destination.clone(),
+        dry_run: false,
+        plan: Vec::new(),
+        steps: vec![
+            DeployStepReport {
+                name: "cargo build".to_owned(),
+                status: StepStatus::Skipped,
+                detail: Some("installed binary already matches the built source".to_owned()),
+            },
+            DeployStepReport {
+                name: "rotate".to_owned(),
+                status: StepStatus::Skipped,
+                detail: Some(format!(
+                    "{} already matches {}",
+                    destination.display(),
+                    source.display()
+                )),
+            },
+        ],
+        hooks: Vec::new(),
+    }))
+}
+
+/// Verify that the rotation installed exactly the source binary.
+fn verify_install(context: &DeployContext) -> Result<()> {
+    let source = context.built_binary_path();
+    let destination = &context.install_path;
+    if !destination.is_file() {
+        anyhow::bail!(
+            "installed binary is missing after rotation: {}",
+            destination.display()
+        );
+    }
+    let source_fingerprint = file_fingerprint(&source)
+        .with_context(|| format!("could not fingerprint source {}", source.display()))?;
+    let destination_fingerprint = file_fingerprint(destination).with_context(|| {
+        format!(
+            "could not fingerprint installed binary {}",
+            destination.display()
+        )
+    })?;
+    if source_fingerprint != destination_fingerprint {
+        anyhow::bail!(
+            "installed binary {} ({destination_fingerprint}) does not match the source {} ({source_fingerprint})",
+            destination.display(),
+            source.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = fs::metadata(destination)?.permissions().mode();
+        if mode & 0o111 == 0 {
+            anyhow::bail!(
+                "installed binary {} is not executable (mode {mode:o})",
+                destination.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Record the deployed fingerprints in `state_dir` for diagnostics.
+fn write_deploy_stamp(context: &DeployContext) -> Result<()> {
+    let source = context.built_binary_path();
+    let destination = &context.install_path;
+    let source_fingerprint = file_fingerprint(&source)?;
+    let destination_fingerprint = file_fingerprint(destination)?;
+    fs::create_dir_all(&context.state_dir)
+        .with_context(|| format!("could not create state dir {}", context.state_dir.display()))?;
+    let path = context
+        .state_dir
+        .join(format!("{}.stamp", context.binary_name));
+    let temporary = context
+        .state_dir
+        .join(format!("{}.stamp.tmp", context.binary_name));
+    let deployed_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let contents = format!(
+        "schema=1\nbinary={}\nsource={}\ndestination={}\nsource_fingerprint={source_fingerprint}\ndestination_fingerprint={destination_fingerprint}\ndeployed_at={deployed_at}\n",
+        context.binary_name,
+        source.display(),
+        destination.display()
+    );
+    fs::write(&temporary, contents)
+        .with_context(|| format!("could not write stamp {}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("could not replace stamp {}", path.display()))?;
+    Ok(())
 }
 
 /// Start a deploy plan. The returned builder includes the default build and
@@ -372,6 +550,13 @@ impl DeployStep {
 pub struct CargoBuildStep {
     pub package: String,
     pub release: bool,
+    pub cargo: Option<PathBuf>,
+    pub profile: Option<String>,
+    pub locked: bool,
+    pub target: Option<String>,
+    pub target_dir: Option<PathBuf>,
+    pub features: Vec<String>,
+    pub no_default_features: bool,
     pub extra_args: Vec<String>,
 }
 
@@ -380,6 +565,13 @@ impl CargoBuildStep {
         Self {
             package: context.package.clone(),
             release: context.release,
+            cargo: context.cargo.clone(),
+            profile: context.profile_name.clone(),
+            locked: context.locked,
+            target: context.target.clone(),
+            target_dir: context.target_dir.clone(),
+            features: context.features.clone(),
+            no_default_features: context.no_default_features,
             extra_args: context.build_args.clone(),
         }
     }
@@ -387,16 +579,44 @@ impl CargoBuildStep {
     /// Full command line (program first) used for building. Execution, dry-run
     /// rendering, and error messages all share this source.
     pub fn command_line(&self, _context: &DeployContext) -> Vec<String> {
+        let program = self
+            .cargo
+            .clone()
+            .or_else(|| std::env::var_os("CARGO").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("cargo"));
         let mut line = vec![
-            "cargo".to_owned(),
+            program.display().to_string(),
             "build".to_owned(),
             "-p".to_owned(),
             self.package.clone(),
             "--color".to_owned(),
             "always".to_owned(),
         ];
-        if self.release {
-            line.push("--release".to_owned());
+        match (&self.profile, self.release) {
+            (Some(profile), _) => {
+                line.push("--profile".to_owned());
+                line.push(profile.clone());
+            }
+            (None, true) => line.push("--release".to_owned()),
+            (None, false) => {}
+        }
+        if self.locked {
+            line.push("--locked".to_owned());
+        }
+        if let Some(target) = &self.target {
+            line.push("--target".to_owned());
+            line.push(target.clone());
+        }
+        if let Some(target_dir) = &self.target_dir {
+            line.push("--target-dir".to_owned());
+            line.push(target_dir.display().to_string());
+        }
+        if !self.features.is_empty() {
+            line.push("--features".to_owned());
+            line.push(self.features.join(","));
+        }
+        if self.no_default_features {
+            line.push("--no-default-features".to_owned());
         }
         line.extend(self.extra_args.iter().cloned());
         line
@@ -669,12 +889,23 @@ pub struct DeployStepReport {
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use super::{CargoBuildStep, DeployStep, RunStep, StepStatus, deploy};
+    use super::{
+        CargoBuildStep, DeployStep, RunStep, StepStatus, deploy, skip_current_report,
+        verify_install, write_deploy_stamp,
+    };
     use crate::context::DeployContext;
 
     fn test_context() -> DeployContext {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
         let mut context = DeployContext::new(std::env::temp_dir(), "tracel-deploy-test");
         context.quiet = true;
+        context.state_dir = std::env::temp_dir().join(format!(
+            "tracel-deploy-state-{}-{unique}",
+            std::process::id()
+        ));
         context
     }
 
@@ -736,7 +967,8 @@ mod tests {
             report
                 .plan
                 .iter()
-                .any(|line| line.contains("cargo build -p tracel-deploy-test")),
+                .any(|line| line.contains("-p tracel-deploy-test")
+                    && line.contains("--color always")),
             "plan: {:?}",
             report.plan
         );
@@ -936,5 +1168,157 @@ mod tests {
         assert!(detail.contains("exit"), "detail: {detail}");
         assert!(detail.contains("boom"), "detail: {detail}");
         assert_eq!(report.steps[0].status, StepStatus::Success);
+    }
+
+    #[test]
+    fn identical_artifacts_skip_the_default_plan() {
+        let dir = std::env::temp_dir().join(format!(
+            "tracel-deploy-skip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let source = dir.join("source");
+        let destination = dir.join("installed");
+        std::fs::write(&source, "same bytes").expect("source");
+        std::fs::write(&destination, "same bytes").expect("destination");
+
+        let context = crate::context::DeployContext::builder(&dir, "tracel-deploy-test")
+            .quiet(true)
+            .source(&source)
+            .install_to(&destination)
+            .state_dir(dir.join("state"))
+            .build();
+
+        let report = deploy(&context).run().expect("skipped deploy");
+
+        assert_eq!(report.steps.len(), 2);
+        assert_eq!(report.steps[0].status, StepStatus::Skipped);
+        assert_eq!(report.steps[1].status, StepStatus::Skipped);
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("destination"),
+            "same bytes"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn force_disables_the_skip() {
+        let mut context = test_context();
+        let dir = std::env::temp_dir().join(format!(
+            "tracel-deploy-force-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let source = dir.join("source");
+        let destination = dir.join("installed");
+        std::fs::write(&source, "same bytes").expect("source");
+        std::fs::write(&destination, "same bytes").expect("destination");
+        context.source_binary = Some(source);
+        context.install_path = destination;
+
+        assert!(skip_current_report(&context).expect("compare").is_some());
+        context.force = true;
+        assert!(skip_current_report(&context).expect("compare").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deploy_lock_blocks_concurrent_deploys() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "tracel-deploy-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        let lock = crate::context::DeployLock::acquire(&state_dir, "test-binary").expect("lock");
+        assert!(lock.path().is_file());
+
+        let error = crate::context::DeployLock::acquire(&state_dir, "test-binary")
+            .expect_err("second lock must fail");
+        assert!(
+            format!("{error:#}").contains("deployment already running"),
+            "error: {error:#}"
+        );
+
+        drop(lock);
+        let lock = crate::context::DeployLock::acquire(&state_dir, "test-binary")
+            .expect("lock after release");
+        drop(lock);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn verify_install_reports_mismatches() {
+        let dir = std::env::temp_dir().join(format!(
+            "tracel-deploy-verify-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let source = dir.join("source");
+        let destination = dir.join("installed");
+        std::fs::write(&source, "new").expect("source");
+        std::fs::write(&destination, "old").expect("destination");
+
+        let mut context = test_context();
+        context.source_binary = Some(source.clone());
+        context.install_path = destination.clone();
+        let error = verify_install(&context).expect_err("mismatch must fail");
+        let text = format!("{error:#}");
+        assert!(text.contains("does not match"), "text: {text}");
+        assert!(text.contains(&source.display().to_string()), "text: {text}");
+        assert!(
+            text.contains(&destination.display().to_string()),
+            "text: {text}"
+        );
+
+        std::fs::write(&destination, "new").expect("destination");
+        verify_install(&context).expect("matching fingerprints pass");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deploy_stamp_records_fingerprints() {
+        let dir = std::env::temp_dir().join(format!(
+            "tracel-deploy-stamp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let source = dir.join("source");
+        let destination = dir.join("installed");
+        std::fs::write(&source, "bytes").expect("source");
+        std::fs::write(&destination, "bytes").expect("destination");
+
+        let mut context = test_context();
+        context.state_dir = dir.join("state");
+        context.source_binary = Some(source);
+        context.install_path = destination;
+
+        write_deploy_stamp(&context).expect("write stamp");
+
+        let stamp = std::fs::read_to_string(context.state_dir.join("tracel-deploy-test.stamp"))
+            .expect("stamp file");
+        assert!(stamp.contains("schema=1"), "stamp: {stamp}");
+        assert!(stamp.contains("source_fingerprint="), "stamp: {stamp}");
+        assert!(stamp.contains("destination_fingerprint="), "stamp: {stamp}");
+        assert!(stamp.contains("deployed_at="), "stamp: {stamp}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

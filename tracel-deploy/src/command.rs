@@ -51,6 +51,27 @@ pub struct DeployCmdArgs {
     /// Directory for state, locks, stamps, and logs.
     #[arg(long, value_name = "DIR")]
     pub state_dir: Option<PathBuf>,
+    /// Cargo executable to run instead of `$CARGO` / `cargo`.
+    #[arg(long, value_name = "PATH")]
+    pub cargo: Option<PathBuf>,
+    /// Custom cargo profile (for example `dist`) instead of `--release`.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+    /// Pass `--locked` to cargo.
+    #[arg(long)]
+    pub locked: bool,
+    /// Cross-compilation target triple passed to cargo.
+    #[arg(long, value_name = "TRIPLE")]
+    pub target: Option<String>,
+    /// Explicit cargo target directory.
+    #[arg(long, value_name = "DIR")]
+    pub target_dir: Option<PathBuf>,
+    /// Comma separated cargo features to enable.
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    pub features: Vec<String>,
+    /// Pass `--no-default-features` to cargo.
+    #[arg(long)]
+    pub no_default_features: bool,
     /// Extra arguments forwarded to `cargo build` after `--`.
     #[arg(last = true)]
     pub build_args: Vec<String>,

@@ -63,6 +63,43 @@ pub fn run(args: tracel_deploy::DeployCmdArgs, _env: Environment, _ctx: Context)
 For a totally custom ordering, use `without_defaults()` and append
 `DeployStep::Run`, `DeployStep::Rotate`, `DeployStep::Custom`, etc.
 
+The default plan stays in place when steps only need to be *inserted*:
+`insert_after_default_build` and `insert_before_default_rotate` put a step
+between the build and the rotation, which is where a service stop belongs
+(stopping in a `pre` hook would stop the service before the build, and a failed
+build would leave it down):
+
+```rust
+tracel_deploy::deploy(&context)
+    .insert_after_default_build(DeployStep::Run(RunStep::new("my-service").args(["stop"])))
+    .finally(|_| run_step("my-service", &["start"]))
+    .run()?;
+```
+
+`DeployContext::builder(workspace, "my-service")` configures the context
+fluently (`release`, `quiet`, `force`, `source`, `install_to`, `backup_dir`,
+`state_dir`, `build_args`) and can point the build at a custom cargo executable,
+profile, target triple, target directory, and features
+(`--cargo`, `--profile`, `--locked`, `--target`, `--target-dir`, `--features`,
+`--no-default-features` on the command line). `CARGO_TARGET_DIR` and
+`CARGO_BUILD_TARGET` are honoured when locating the built binary;
+`resolved_binary_path()` fails with the full list of paths it tried.
+
+## Idempotent Deploys
+
+Default plans are idempotent: when the built source and the installed binary
+have the same size and content hash, the plan is skipped and the destination is
+left untouched (`force = true` / `--force` runs the full plan anyway). Skipped
+steps are reported as `StepStatus::Skipped`.
+
+Every non-dry-run deployment takes a lock in `state_dir`
+(`<binary>.deploy.lock`), so two deployments of the same binary cannot rotate it
+concurrently; the lock error names the file to delete after a crashed deploy.
+After a successful rotation the installed binary is verified against the source
+(content hash, size, and - on Unix - the executable bit), and a
+`<binary>.stamp` file with both fingerprints is written to `state_dir` for
+diagnostics.
+
 ## Running-Binary Rotation
 
 `rotate` replaces the installed binary without requiring the running process to
@@ -71,9 +108,10 @@ exit first:
 - **Linux/macOS**: `fs::rename` a sibling temporary file over the destination.
   The running process keeps the old inode; the replacement is atomic.
 - **Windows**: a normal copy is attempted first. If the destination is locked
-  by a running executable (`ERROR_ACCESS_DENIED`, `ERROR_SHARING_VIOLATION`, or
-  `ERROR_LOCK_VIOLATION`), the old binary is renamed aside and the new binary is
-  copied into place. The running process keeps the renamed old file.
+  by a running executable (`ERROR_ACCESS_DENIED`, `ERROR_SHARING_VIOLATION`,
+  `ERROR_LOCK_VIOLATION`, or `ERROR_USER_MAPPED_FILE`), the old binary is
+  renamed aside and the new binary is copied into place. The running process
+  keeps the renamed old file.
 
 `RotateStrategy::Auto` picks the above behaviour. `Replace`, `Atomic`, and
 `RenameAside` are available for callers that want an explicit strategy.
