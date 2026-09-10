@@ -1,7 +1,7 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result};
@@ -21,13 +21,17 @@ pub enum RotateStrategy {
     RenameAside,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RotateOptions {
     pub source: PathBuf,
     pub destination: PathBuf,
     pub backup_dir: Option<PathBuf>,
     pub strategy: RotateStrategy,
     pub dry_run: bool,
+    /// Keep at most this many `<binary>.old-*` backups (newest first).
+    pub backup_retention: Option<usize>,
+    /// Remove `<binary>.old-*` backups older than this age.
+    pub backup_max_age: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,22 +74,106 @@ pub fn rotate(options: &RotateOptions) -> Result<RotateOutcome> {
                 destination.display()
             )
         })?;
-        return Ok(RotateOutcome::Replaced { destination });
+        let outcome = RotateOutcome::Replaced { destination };
+        cleanup_old_backups(options, &outcome);
+        return Ok(outcome);
     }
 
-    match options.strategy {
-        RotateStrategy::Replace => replace_in_place(options, &destination),
-        RotateStrategy::Atomic => atomic_replace(options, &destination),
-        RotateStrategy::RenameAside => rename_aside_replace(options, &destination),
+    let outcome = match options.strategy {
+        RotateStrategy::Replace => replace_in_place(options, &destination)?,
+        RotateStrategy::Atomic => atomic_replace(options, &destination)?,
+        RotateStrategy::RenameAside => rename_aside_replace(options, &destination)?,
         RotateStrategy::Auto => {
             #[cfg(windows)]
             {
-                replace_in_place(options, &destination)
+                replace_in_place(options, &destination)?
             }
             #[cfg(not(windows))]
             {
-                atomic_replace(options, &destination)
+                atomic_replace(options, &destination)?
             }
+        }
+    };
+    cleanup_old_backups(options, &outcome);
+    Ok(outcome)
+}
+
+/// Best-effort removal of `<binary>.old-*` backups for the rotated destination.
+///
+/// Removal is intentionally best effort: on Windows a backup that a still
+/// running process occupies cannot be deleted yet, and that must never fail
+/// the rotation. Only files matching the destination's own backup prefix are
+/// considered, so unrelated binaries are left alone.
+fn cleanup_old_backups(options: &RotateOptions, outcome: &RotateOutcome) {
+    let destination = match outcome {
+        RotateOutcome::Replaced { destination }
+        | RotateOutcome::ReplacedAfterRename { destination, .. } => destination,
+        RotateOutcome::WouldReplace { .. } => return,
+    };
+    cleanup_backups_with(
+        destination,
+        options.backup_dir.as_deref(),
+        options.backup_retention,
+        options.backup_max_age,
+        |path| fs::remove_file(path),
+    );
+}
+
+fn cleanup_backups_with<F>(
+    destination: &Path,
+    backup_dir: Option<&Path>,
+    backup_retention: Option<usize>,
+    backup_max_age: Option<Duration>,
+    remove: F,
+) where
+    F: Fn(&Path) -> io::Result<()>,
+{
+    if backup_retention.is_none() && backup_max_age.is_none() {
+        return;
+    }
+    let dir = backup_dir.map(Path::to_path_buf).unwrap_or_else(|| {
+        destination
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
+    let Some(file_name) = destination.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let prefix = format!("{file_name}.old-");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    let mut backups: Vec<(PathBuf, SystemTime)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        backups.push((
+            entry.path(),
+            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        ));
+    }
+    backups.sort_by(|left, right| right.1.cmp(&left.1));
+    for (index, (path, modified)) in backups.iter().enumerate() {
+        let over_retention = backup_retention.is_some_and(|keep| index >= keep);
+        let too_old = backup_max_age.is_some_and(|max_age| match now.duration_since(*modified) {
+            Ok(age) => age > max_age,
+            Err(_) => true,
+        });
+        if over_retention || too_old {
+            let _ = remove(path);
         }
     }
 }
@@ -153,11 +241,18 @@ fn rename_aside_replace(options: &RotateOptions, destination: &Path) -> Result<R
             backup,
         }),
         Err(error) => {
-            let _ = fs::rename(&backup, destination);
+            let rollback = fs::rename(&backup, destination);
+            let rollback = match rollback {
+                Ok(()) => "the previous binary was restored".to_owned(),
+                Err(rollback_error) => {
+                    format!("restoring {} failed: {rollback_error}", backup.display())
+                }
+            };
             Err(error).with_context(|| {
                 format!(
-                    "failed to install {} after renaming the old binary aside",
-                    destination.display()
+                    "failed to install {} after renaming the old binary aside to {}; {rollback}",
+                    destination.display(),
+                    backup.display()
                 )
             })
         }
@@ -267,10 +362,10 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use super::{RotateOptions, RotateOutcome, RotateStrategy, rotate};
+    use super::{RotateOptions, RotateOutcome, RotateStrategy, cleanup_backups_with, rotate};
 
     #[cfg(unix)]
     use std::io::Read;
@@ -288,6 +383,26 @@ mod tests {
         path
     }
 
+    fn touch_aged(path: &PathBuf, age: Duration) {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open backup");
+        file.set_modified(SystemTime::now() - age)
+            .expect("set backup mtime");
+    }
+
+    fn backup_names(dir: &PathBuf) -> Vec<String> {
+        let mut names = fs::read_dir(dir)
+            .expect("read dir")
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.contains(".old-"))
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
     #[test]
     fn replaces_missing_destination() {
         let dir = temp_dir("missing");
@@ -301,6 +416,7 @@ mod tests {
             backup_dir: None,
             strategy: RotateStrategy::Auto,
             dry_run: false,
+            ..RotateOptions::default()
         })
         .expect("rotate");
         assert!(matches!(outcome, RotateOutcome::Replaced { .. }));
@@ -322,6 +438,7 @@ mod tests {
             backup_dir: None,
             strategy: RotateStrategy::Auto,
             dry_run: true,
+            ..RotateOptions::default()
         })
         .expect("rotate");
         assert!(matches!(outcome, RotateOutcome::WouldReplace { .. }));
@@ -343,6 +460,7 @@ mod tests {
             backup_dir: None,
             strategy: RotateStrategy::RenameAside,
             dry_run: false,
+            ..RotateOptions::default()
         })
         .expect("rotate");
         match outcome {
@@ -371,6 +489,7 @@ mod tests {
             backup_dir: None,
             strategy: RotateStrategy::Atomic,
             dry_run: false,
+            ..RotateOptions::default()
         })
         .expect("rotate");
         assert!(matches!(outcome, RotateOutcome::Replaced { .. }));
@@ -381,6 +500,135 @@ mod tests {
             .expect("read running inode");
         assert_eq!(old, "old");
         assert_eq!(fs::read_to_string(&destination).expect("read new"), "new");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn backup_retention_keeps_newest_backups() {
+        let dir = temp_dir("retention");
+        let source = dir.join("source");
+        let destination = dir.join("destination");
+        fs::write(&source, "new").expect("source");
+        fs::write(&destination, "old").expect("destination");
+        for (name, age_hours) in [
+            ("destination.old-1-1", 3_u64),
+            ("destination.old-2-2", 2),
+            ("destination.old-3-3", 1),
+        ] {
+            let path = dir.join(name);
+            fs::write(&path, "backup").expect("backup");
+            touch_aged(&path, Duration::from_secs(age_hours * 3_600));
+        }
+        let other = dir.join("other.old-1-1");
+        fs::write(&other, "other").expect("other backup");
+
+        rotate(&RotateOptions {
+            source,
+            destination: destination.clone(),
+            backup_dir: None,
+            strategy: RotateStrategy::RenameAside,
+            dry_run: false,
+            backup_retention: Some(2),
+            backup_max_age: None,
+        })
+        .expect("rotate");
+
+        let backups = backup_names(&dir);
+        assert_eq!(backups.len(), 3, "kept: {backups:?}");
+        assert!(
+            backups
+                .iter()
+                .any(|name| name.starts_with(&format!("destination.old-{}", std::process::id()))),
+            "the backup created by this rotation is kept: {backups:?}"
+        );
+        assert!(
+            backups.iter().any(|name| name == "other.old-1-1"),
+            "backups of other binaries are not touched: {backups:?}"
+        );
+        assert!(
+            !backups.iter().any(|name| name == "destination.old-1-1"),
+            "the oldest backup is removed: {backups:?}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn backup_max_age_removes_old_backups() {
+        let dir = temp_dir("max-age");
+        let source = dir.join("source");
+        let destination = dir.join("destination");
+        fs::write(&source, "new").expect("source");
+        fs::write(&destination, "old").expect("destination");
+        for (name, age_hours) in [
+            ("destination.old-1-1", 72_u64),
+            ("destination.old-2-2", 48),
+            ("destination.old-3-3", 1),
+        ] {
+            let path = dir.join(name);
+            fs::write(&path, "backup").expect("backup");
+            touch_aged(&path, Duration::from_secs(age_hours * 3_600));
+        }
+
+        rotate(&RotateOptions {
+            source,
+            destination: destination.clone(),
+            backup_dir: None,
+            strategy: RotateStrategy::RenameAside,
+            dry_run: false,
+            backup_retention: None,
+            backup_max_age: Some(Duration::from_secs(36 * 3_600)),
+        })
+        .expect("rotate");
+
+        let backups = backup_names(&dir);
+        assert_eq!(backups.len(), 2, "kept: {backups:?}");
+        assert!(backups.iter().any(|name| name == "destination.old-3-3"));
+        assert!(!backups.iter().any(|name| name == "destination.old-1-1"));
+        assert!(!backups.iter().any(|name| name == "destination.old-2-2"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cleanup_ignores_removal_failures() {
+        let dir = temp_dir("cleanup-failure");
+        let destination = dir.join("destination");
+        fs::write(&destination, "old").expect("destination");
+        for name in ["destination.old-1-1", "destination.old-2-2"] {
+            fs::write(dir.join(name), "backup").expect("backup");
+        }
+
+        cleanup_backups_with(&destination, None, Some(0), None, |_path| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "still in use",
+            ))
+        });
+
+        assert_eq!(backup_names(&dir).len(), 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dry_run_keeps_backups() {
+        let dir = temp_dir("dry-run-backups");
+        let source = dir.join("source");
+        let destination = dir.join("destination");
+        fs::write(&source, "new").expect("source");
+        fs::write(&destination, "old").expect("destination");
+        fs::write(dir.join("destination.old-1-1"), "backup").expect("backup");
+
+        rotate(&RotateOptions {
+            source,
+            destination: destination.clone(),
+            backup_dir: None,
+            strategy: RotateStrategy::Auto,
+            dry_run: true,
+            backup_retention: Some(0),
+            backup_max_age: None,
+        })
+        .expect("rotate");
+
+        assert_eq!(backup_names(&dir).len(), 1);
         let _ = fs::remove_dir_all(dir);
     }
 }

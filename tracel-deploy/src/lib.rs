@@ -23,8 +23,8 @@ pub mod rotate;
 pub use command::DeployCmdArgs;
 pub use context::{DeployContext, Profile};
 pub use plan::{
-    CargoBuildStep, DeployBuilder, DeployHook, DeployPlan, DeployReport, DeployStep,
-    DeployStepReport, RotateStep, RunStep, deploy,
+    CargoBuildStep, DeployBuilder, DeployHook, DeployHookEntry, DeployHookReport, DeployPlan,
+    DeployReport, DeployStep, DeployStepReport, RotateStep, RunStep, StepStatus, deploy,
 };
 pub use rotate::{RotateOptions, RotateOutcome, RotateStrategy, rotate};
 pub use tracel_deploy_macros::deploy_commands;
@@ -37,9 +37,10 @@ pub mod __private {
 
 pub mod prelude {
     pub use crate::{
-        CargoBuildStep, DeployBuilder, DeployCmdArgs, DeployContext, DeployHook, DeployPlan,
-        DeployReport, DeployStep, DeployStepReport, Profile, RotateOptions, RotateOutcome,
-        RotateStep, RotateStrategy, RunStep, deploy, rotate,
+        CargoBuildStep, DeployBuilder, DeployCmdArgs, DeployContext, DeployHook, DeployHookEntry,
+        DeployHookReport, DeployPlan, DeployReport, DeployStep, DeployStepReport, Profile,
+        RotateOptions, RotateOutcome, RotateStep, RotateStrategy, RunStep, StepStatus, deploy,
+        rotate,
     };
     pub use tracel_deploy_macros::deploy_commands;
     pub use tracel_xtask::prelude::{Context, Environment, XtaskArgs};

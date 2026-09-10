@@ -42,6 +42,12 @@ pub struct DeployCmdArgs {
     /// Directory for rotated backups. Defaults next to the destination.
     #[arg(long, value_name = "DIR")]
     pub backup_dir: Option<PathBuf>,
+    /// Keep at most this many rotated backups (`<binary>.old-*`).
+    #[arg(long, value_name = "COUNT")]
+    pub backup_retention: Option<usize>,
+    /// Remove rotated backups older than this many days.
+    #[arg(long, value_name = "DAYS")]
+    pub backup_max_age_days: Option<u64>,
     /// Directory for state, locks, stamps, and logs.
     #[arg(long, value_name = "DIR")]
     pub state_dir: Option<PathBuf>,

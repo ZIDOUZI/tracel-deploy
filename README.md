@@ -79,7 +79,11 @@ exit first:
 `RenameAside` are available for callers that want an explicit strategy.
 
 `RotateOptions::backup_dir` can direct old Windows binaries into a state
-directory instead of the install directory.
+directory instead of the install directory. `RotateOptions::backup_retention`
+(keep the newest N backups) and `RotateOptions::backup_max_age` remove stale
+`<binary>.old-*` files after a successful rotation; backups that are still held
+by a running process are left in place, and `--backup-retention` /
+`--backup-max-age-days` expose the same settings on the command line.
 
 ## State and Hooks
 
@@ -94,5 +98,32 @@ tracel_deploy::deploy(&context)
     .run()?;
 ```
 
-If a pre hook or step fails, post hooks are skipped. Best-effort cleanup can be
-modelled with `RunStep::allow_failure(true)`.
+Hooks run in four phases: `pre -> steps -> post -> finally`. A failing pre
+hook, step, or post hook skips `post`, then runs the `on_error` hooks (rollback,
+alerting) followed by the `finally` hooks. `finally` hooks always run - also
+when an `on_error` hook fails - and every failure is aggregated with the
+original error kept first. A service that is stopped before the rotation should
+be restarted from `finally`, so a failed rotation cannot leave it down:
+
+```rust
+tracel_deploy::deploy(&context)
+    .step(DeployStep::Run(RunStep::new("my-service").args(["stop"])))
+    .on_error(|_| eprintln!("deploy failed; restarting the previous service"))
+    .finally(|_| run_step("my-service", &["start"]))
+    .run()?;
+```
+
+Hooks can be named (`pre_named`, `post_named`, `on_error_named`,
+`finally_named`); the name shows up in error messages and in
+`DeployReport::hooks`. Best-effort cleanup inside a step can be modelled with
+`RunStep::allow_failure(true)`, which keeps the exit code and the stderr tail in
+the step report.
+
+`--dry-run` renders the full plan without executing any hook or step. Unless
+`quiet` is set, the plan is printed as `would: ...` lines and it is always
+available as `DeployReport::plan`:
+
+```text
+would: cargo build -p my-service --color always --release
+would: rotate D:\work\my-service\target\release\my-service.exe -> C:\Users\me\.cargo\bin\my-service.exe
+```

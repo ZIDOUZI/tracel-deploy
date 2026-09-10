@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result};
@@ -34,6 +35,10 @@ pub struct DeployContext {
     pub source_binary: Option<PathBuf>,
     pub install_path: PathBuf,
     pub backup_dir: Option<PathBuf>,
+    /// Keep at most this many `<binary>.old-*` backups (newest first).
+    pub backup_retention: Option<usize>,
+    /// Remove `<binary>.old-*` backups older than this age.
+    pub backup_max_age: Option<Duration>,
     pub state_dir: PathBuf,
     pub build_args: Vec<String>,
 }
@@ -56,6 +61,8 @@ impl DeployContext {
             source_binary: None,
             install_path,
             backup_dir: None,
+            backup_retention: None,
+            backup_max_age: None,
             state_dir: default_state_dir(),
             build_args: Vec::new(),
         }
@@ -84,6 +91,10 @@ impl DeployContext {
             default_cargo_bin_dir().join(binary_name_with_extension(&context.binary_name))
         });
         context.backup_dir = args.backup_dir.clone();
+        context.backup_retention = args.backup_retention;
+        context.backup_max_age = args
+            .backup_max_age_days
+            .map(|days| Duration::from_secs(days.saturating_mul(86_400)));
         context.state_dir = args.state_dir.clone().unwrap_or_else(default_state_dir);
         context.build_args = args.build_args.clone();
         Ok(context)
