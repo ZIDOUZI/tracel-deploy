@@ -67,9 +67,10 @@ impl DeployHookEntry {
 ///     .run()?;
 /// ```
 pub trait Reporter {
-    /// The dry-run plan: one line per step that would run, the same lines as
-    /// [`DeployReport::plan`]. [`StdoutReporter`] renders each line as
-    /// `would: <line>` unless it is quiet.
+    /// The dry-run plan: one line per hook and step that would run, in
+    /// execution order, the same lines as [`DeployReport::plan`].
+    /// [`StdoutReporter`] renders each line as `would: <line>` unless it is
+    /// quiet.
     fn plan(&mut self, lines: &[String]) {
         let _ = lines;
     }
@@ -183,11 +184,16 @@ fn default_reporter(context: &DeployContext) -> StdoutReporter {
 /// pre hooks -> steps -> post hooks -> finally hooks
 /// ```
 ///
+/// [`preflight`](DeployPlan::preflight) hooks are the exception: they run only
+/// during a dry run, for read-only checks, and the rendered plan is reported
+/// after them. A real deploy never runs them.
+///
 /// On success every phase runs in order. On failure the failing phase stops,
 /// `post` hooks are skipped, and the `on_error` and `finally` hooks still run.
 /// `finally` hooks always run (also when `on_error` fails) and every failure is
 /// aggregated, with the original error kept first in the chain.
 pub struct DeployPlan {
+    pub preflight: Vec<DeployHookEntry>,
     pub pre: Vec<DeployHookEntry>,
     pub steps: Vec<DeployStep>,
     pub post: Vec<DeployHookEntry>,
@@ -198,6 +204,7 @@ pub struct DeployPlan {
 impl DeployPlan {
     pub fn new() -> Self {
         Self {
+            preflight: Vec::new(),
             pre: Vec::new(),
             steps: Vec::new(),
             post: Vec::new(),
@@ -214,13 +221,24 @@ impl DeployPlan {
         ]
     }
 
-    /// One line per step describing what would run (used by dry-run and
-    /// reports).
+    /// One line per hook and step describing what would run, in execution
+    /// order (used by dry-run and reports).
+    ///
+    /// A named hook renders as `<phase>: <name>` (`pre: stop service`), an
+    /// unnamed one as `<phase> hook #<n>` (`pre hook #1`), and a step renders
+    /// as [`DeployStep::describe`]. `preflight` hooks only run during a dry
+    /// run, so they are only listed when `context.dry_run` is set.
     pub fn render(&self, context: &DeployContext) -> Vec<String> {
-        self.steps
-            .iter()
-            .map(|step| step.describe(context))
-            .collect()
+        let mut lines = Vec::new();
+        if context.dry_run {
+            push_hook_plan_lines(&mut lines, "preflight", &self.preflight);
+        }
+        push_hook_plan_lines(&mut lines, "pre", &self.pre);
+        lines.extend(self.steps.iter().map(|step| step.describe(context)));
+        push_hook_plan_lines(&mut lines, "post", &self.post);
+        push_hook_plan_lines(&mut lines, "on_error", &self.on_error);
+        push_hook_plan_lines(&mut lines, "finally", &self.finally);
+        lines
     }
 
     pub fn run(self, context: &DeployContext) -> Result<DeployReport> {
@@ -245,12 +263,29 @@ impl DeployPlan {
             hooks: Vec::new(),
         };
         if context.dry_run {
-            report.plan = self.render(context);
+            // The plan is rendered before the checks run so that it can be
+            // reported even when a preflight hook fails.
+            let plan = self.render(context);
+            let mut failures = Vec::new();
+            run_hook_phase(
+                "preflight",
+                self.preflight,
+                context,
+                &mut report,
+                &mut failures,
+            );
+            report.plan = plan;
             reporter.plan(&report.plan);
+            if !failures.is_empty() {
+                return Err(preflight_failure(failures, &report.hooks, &report.plan));
+            }
             return Ok(report);
         }
 
+        // Preflight hooks are read-only checks for a dry run; a real deploy
+        // never runs them, so the phase is dropped here.
         let Self {
+            preflight: _,
             pre,
             steps,
             post,
@@ -296,6 +331,44 @@ impl DeployPlan {
     }
 }
 
+/// The error of a dry run whose preflight hooks failed.
+///
+/// The failing hooks keep their cause chain and the message lists every check
+/// that ran, plus the plan that was rendered instead of executed; the caller
+/// gets the reason and the "what would have happened" in one error.
+fn preflight_failure(
+    failures: Vec<anyhow::Error>,
+    hooks: &[DeployHookReport],
+    plan: &[String],
+) -> anyhow::Error {
+    let checked = hooks
+        .iter()
+        .map(|hook| {
+            if hook.succeeded {
+                format!("{} (ok)", hook.name)
+            } else {
+                format!("{} (failed)", hook.name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let planned = if plan.is_empty() {
+        "nothing".to_owned()
+    } else {
+        plan.join("; ")
+    };
+    let mut failures = failures.into_iter();
+    let mut error = failures
+        .next()
+        .expect("a preflight failure is reported together with its error");
+    for extra in failures {
+        error = error.context(format!("additional failure: {extra:#}"));
+    }
+    error.context(format!(
+        "dry run: preflight failed, no deploy step was executed; checked: {checked}; planned: {planned}"
+    ))
+}
+
 fn run_hook_phase(
     phase: &str,
     hooks: Vec<DeployHookEntry>,
@@ -330,6 +403,28 @@ impl Default for DeployPlan {
     }
 }
 
+/// Append one plan line per hook in `hooks`, labelled with its phase.
+fn push_hook_plan_lines(lines: &mut Vec<String>, phase: &str, hooks: &[DeployHookEntry]) {
+    lines.extend(
+        hooks
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| hook_plan_line(phase, index, entry)),
+    );
+}
+
+/// One plan line for a hook: `<phase>: <name>` for a named hook, and the
+/// `<phase> hook #<n>` label used in errors and reports for an unnamed one.
+///
+/// The phase prefix is what makes a plan line self-explanatory; errors and
+/// reports keep the bare label.
+fn hook_plan_line(phase: &str, index: usize, entry: &DeployHookEntry) -> String {
+    match &entry.name {
+        Some(name) => format!("{phase}: {name}"),
+        None => entry.label(phase, index),
+    }
+}
+
 /// Builder returned by [`deploy`].
 ///
 /// By default it runs:
@@ -337,6 +432,9 @@ impl Default for DeployPlan {
 /// 1. [`CargoBuildStep`] for `context.package`.
 /// 2. [`RotateStep`] from `context.built_binary_path()` to
 ///    `context.install_path`.
+///
+/// [`DeployBuilder::preflight`] adds read-only checks that run only during a dry
+/// run.
 ///
 /// Use [`DeployBuilder::without_defaults`] to fully replace the default plan.
 ///
@@ -382,6 +480,36 @@ impl<'a> DeployBuilder<'a> {
     /// structured events implements [`Reporter`].
     pub fn reporter(mut self, reporter: impl Reporter + 'static) -> Self {
         self.reporter = Some(Box::new(reporter));
+        self
+    }
+
+    /// Add an unnamed hook that runs only during a dry run, for read-only
+    /// checks: verifying a signature or version, whether `install_to` is
+    /// writable, or taking a snapshot of the current service state.
+    ///
+    /// A dry run renders the plan, runs the preflight hooks, and then reports
+    /// the plan through the reporter, so a failing check still shows what would
+    /// have run. The hooks are reported through [`DeployReport::hooks`], and a
+    /// failure fails the dry run (a non-zero exit status for a caller that maps
+    /// the error onto one) with the checked items and the rendered plan in the
+    /// error. A real deploy never runs preflight hooks.
+    pub fn preflight<F>(self, hook: F) -> Self
+    where
+        F: FnMut(&DeployContext) -> Result<()> + 'static,
+    {
+        self.preflight_named_entry(None, Box::new(hook))
+    }
+
+    /// Add a named preflight hook; the name is used in errors and reports.
+    pub fn preflight_named<F>(self, name: impl Into<String>, hook: F) -> Self
+    where
+        F: FnMut(&DeployContext) -> Result<()> + 'static,
+    {
+        self.preflight_named_entry(Some(name.into()), Box::new(hook))
+    }
+
+    fn preflight_named_entry(mut self, name: Option<String>, hook: DeployHook) -> Self {
+        self.plan.preflight.push(DeployHookEntry::new(name, hook));
         self
     }
 
@@ -487,6 +615,10 @@ impl<'a> DeployBuilder<'a> {
     /// The classic use case is `build -> stop service -> rotate -> start
     /// service`: stopping a service in a `pre` hook would stop it before the
     /// build, so a failed build keeps the service down unnecessarily.
+    ///
+    /// Inserted steps shape the default plan only: after
+    /// [`without_defaults`](Self::without_defaults) the insertion is ignored and
+    /// [`step`](Self::step) is the way to add a step to a caller-owned plan.
     pub fn insert_after_default_build(mut self, step: DeployStep) -> Self {
         self.insert_after_build.push(step);
         self
@@ -497,7 +629,8 @@ impl<'a> DeployBuilder<'a> {
     /// Steps inserted here run in the order they were added. When several
     /// steps are inserted with both methods, all
     /// [`insert_after_default_build`](Self::insert_after_default_build) steps
-    /// run first.
+    /// run first. Like [`insert_after_default_build`](Self::insert_after_default_build),
+    /// this only shapes the default plan.
     pub fn insert_before_default_rotate(mut self, step: DeployStep) -> Self {
         self.insert_before_rotate.push(step);
         self
@@ -1484,10 +1617,12 @@ fn tail_lines(text: &str, count: usize) -> Option<String> {
 pub struct DeployReport {
     pub installed: PathBuf,
     pub dry_run: bool,
-    /// Steps that would run; filled by dry-run.
+    /// The hook and step lines that would run, in execution order; filled by
+    /// dry-run.
     pub plan: Vec<String>,
     pub steps: Vec<DeployStepReport>,
-    /// Hook execution results across pre / post / on_error / finally.
+    /// Hook execution results across preflight (dry run only) / pre / post /
+    /// on_error / finally.
     pub hooks: Vec<DeployHookReport>,
 }
 
@@ -1532,9 +1667,9 @@ mod tests {
     };
 
     use super::{
-        CargoBuildStep, DeployStep, DeployStepReport, NullReporter, Reporter, RotateStep, RunStep,
-        StdoutReporter, StepStatus, default_reporter, deploy, skip_current_report,
-        verify_installed_binary, write_deploy_stamp,
+        CargoBuildStep, DeployBuilder, DeployStep, DeployStepReport, NullReporter, Reporter,
+        RotateStep, RunStep, StdoutReporter, StepStatus, default_reporter, deploy,
+        skip_current_report, verify_installed_binary, write_deploy_stamp,
     };
     use crate::context::{DeployContext, build_inputs_fingerprint};
     use crate::rotate::RotateStrategy;
@@ -1623,6 +1758,170 @@ mod tests {
         );
         assert!(report.steps.is_empty());
         assert!(report.hooks.is_empty());
+    }
+
+    #[test]
+    fn dry_run_runs_preflight_and_nothing_else() {
+        let dir = temp_workspace("dry-run-preflight");
+        let mut context = test_context();
+        context.dry_run = true;
+        context.workspace_root = dir.clone();
+        context.state_dir = dir.join("state");
+        context.install_path = dir.join("bin").join("installed-binary");
+        let before = tree(&dir);
+        let events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let preflight_events = Rc::clone(&events);
+        let pre_events = Rc::clone(&events);
+        let step_events = Rc::clone(&events);
+        let post_events = Rc::clone(&events);
+        let on_error_events = Rc::clone(&events);
+        let finally_events = Rc::clone(&events);
+
+        let report = deploy(&context)
+            .preflight_named("check signature", move |_| {
+                preflight_events.borrow_mut().push("preflight");
+                Ok(())
+            })
+            .pre(move |_| {
+                pre_events.borrow_mut().push("pre");
+                Ok(())
+            })
+            .step(DeployStep::Custom(Box::new(move |_| {
+                step_events.borrow_mut().push("step");
+                Ok(())
+            })))
+            .post(move |_| {
+                post_events.borrow_mut().push("post");
+                Ok(())
+            })
+            .on_error(move |_| {
+                on_error_events.borrow_mut().push("on_error");
+                Ok(())
+            })
+            .finally(move |_| {
+                finally_events.borrow_mut().push("finally");
+                Ok(())
+            })
+            .run()
+            .expect("dry-run plan");
+
+        assert_eq!(*events.borrow(), ["preflight"]);
+        assert_eq!(report.hooks.len(), 1);
+        assert_eq!(report.hooks[0].name, "check signature");
+        assert!(report.hooks[0].succeeded);
+        assert!(report.steps.is_empty());
+        assert!(report.dry_run);
+        assert_eq!(
+            tree(&dir),
+            before,
+            "a dry run must not create, move, or delete any file"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dry_run_plan_lists_hooks_in_execution_order() {
+        let mut context = test_context();
+        context.dry_run = true;
+
+        let report = deploy(&context)
+            .without_defaults()
+            .preflight_named("check signature", |_| Ok(()))
+            .preflight(|_| Ok(()))
+            .pre_named("stop service", |_| Ok(()))
+            .step(DeployStep::Custom(Box::new(|_| Ok(()))))
+            .post_named("restart service", |_| Ok(()))
+            .on_error_named("rollback", |_| Ok(()))
+            .finally(|_| Ok(()))
+            .run()
+            .expect("dry-run plan");
+
+        assert_eq!(
+            report.plan,
+            [
+                "preflight: check signature",
+                "preflight hook #2",
+                "pre: stop service",
+                "custom step (opaque)",
+                "post: restart service",
+                "on_error: rollback",
+                "finally hook #1",
+            ]
+        );
+    }
+
+    #[test]
+    fn preflight_does_not_run_without_dry_run() {
+        let context = test_context();
+        let events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let preflight_events = Rc::clone(&events);
+        let step_events = Rc::clone(&events);
+
+        let report = deploy(&context)
+            .without_defaults()
+            .preflight_named("check signature", move |_| {
+                preflight_events.borrow_mut().push("preflight");
+                anyhow::bail!("preflight runs only during a dry run")
+            })
+            .step(DeployStep::Custom(Box::new(move |_| {
+                step_events.borrow_mut().push("step");
+                Ok(())
+            })))
+            .run()
+            .expect("a real deploy must not run the preflight hooks");
+
+        assert_eq!(*events.borrow(), ["step"]);
+        assert!(report.plan.is_empty(), "plan: {:?}", report.plan);
+        assert!(
+            report.hooks.is_empty(),
+            "hooks: {:?}",
+            report
+                .hooks
+                .iter()
+                .map(|hook| &hook.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_failing_preflight_fails_the_dry_run_with_the_checked_items() {
+        let mut context = test_context();
+        context.dry_run = true;
+        let events = Rc::new(RefCell::new(Vec::new()));
+
+        let error = deploy(&context)
+            .reporter(RecordingReporter::new(&events))
+            .preflight_named("check signature", |_| Ok(()))
+            .preflight_named("check install dir", |_| {
+                anyhow::bail!("install dir is not writable")
+            })
+            .run()
+            .expect_err("a failing preflight hook must fail the dry run");
+
+        let text = format!("{error:#}");
+        assert!(text.contains("check install dir"), "text: {text}");
+        assert!(text.contains("install dir is not writable"), "text: {text}");
+        assert!(
+            text.contains("check signature (ok)"),
+            "the checked items are listed: {text}"
+        );
+        assert!(
+            text.contains("check install dir (failed)"),
+            "the failed check is listed: {text}"
+        );
+        assert!(
+            text.contains("-p tracel-deploy-test"),
+            "the rendered plan is part of the error: {text}"
+        );
+        assert!(text.contains("no deploy step was executed"), "text: {text}");
+
+        let recorded: Vec<String> = events.borrow().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|event| event.starts_with("plan: ") && event.contains("-p tracel-deploy-test")),
+            "the rendered plan is reported before the failure: {recorded:?}"
+        );
     }
 
     #[test]
@@ -2661,5 +2960,391 @@ mod tests {
 
         let injected = stdout_probe("injected");
         assert!(!injected.contains("would:"), "injected: {injected:?}");
+    }
+
+    // --- Acceptance gaps: insertion points, build command lines, lock cleanup ---
+
+    /// A fake `cargo` that logs the arguments it was called with and exits
+    /// successfully, so the default plan can run without a real build (and
+    /// without the sccache and target-dir traffic a nested cargo would cause).
+    fn fake_cargo(dir: &std::path::Path) -> std::path::PathBuf {
+        let log = dir.join("cargo-args.txt");
+        #[cfg(windows)]
+        {
+            let program = dir.join("fake-cargo.cmd");
+            std::fs::write(
+                &program,
+                format!(
+                    "@echo off\r\necho %* >> \"{}\"\r\nexit /b 0\r\n",
+                    log.display()
+                ),
+            )
+            .expect("fake cargo");
+            program
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let program = dir.join("fake-cargo.sh");
+            std::fs::write(
+                &program,
+                format!("#!/bin/sh\necho \"$@\" >> \"{}\"\nexit 0\n", log.display()),
+            )
+            .expect("fake cargo");
+            let mut permissions = std::fs::metadata(&program)
+                .expect("fake cargo")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&program, permissions).expect("fake cargo permissions");
+            program
+        }
+    }
+
+    /// A context whose default plan runs to completion without cargo: a fake
+    /// cargo that succeeds, an existing "built" binary, and an install
+    /// directory.
+    fn default_plan_context(dir: &std::path::Path) -> DeployContext {
+        let source = dir.join("built-binary");
+        std::fs::write(&source, "built bytes").expect("built binary");
+        let install = dir.join("bin").join("installed-binary");
+        std::fs::create_dir_all(install.parent().expect("install parent")).expect("install dir");
+
+        let mut context = DeployContext::builder(dir, "tracel-deploy-test")
+            .quiet(true)
+            .source(&source)
+            .install_to(&install)
+            .state_dir(dir.join("state"))
+            .build();
+        context.cargo = Some(fake_cargo(dir));
+        context
+    }
+
+    /// The default plan with the idempotent skip, the install verification, and
+    /// the stamp disabled: what remains is the plan itself.
+    fn plain_default_builder(context: &DeployContext) -> DeployBuilder<'_> {
+        deploy(context)
+            .idempotent_skip(false)
+            .verify_install(false)
+            .write_deploy_stamp(false)
+    }
+
+    /// A custom step that records `marker` when it runs.
+    fn marker_step(events: &Rc<RefCell<Vec<&'static str>>>, marker: &'static str) -> DeployStep {
+        let events = Rc::clone(events);
+        DeployStep::Custom(Box::new(move |_| {
+            events.borrow_mut().push(marker);
+            Ok(())
+        }))
+    }
+
+    /// Records the default steps by name, so one event list can hold both the
+    /// steps and the hook side effects around them.
+    #[derive(Default)]
+    struct StepOrderReporter {
+        events: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl StepOrderReporter {
+        fn new(events: &Rc<RefCell<Vec<&'static str>>>) -> Self {
+            Self {
+                events: Rc::clone(events),
+            }
+        }
+    }
+
+    impl Reporter for StepOrderReporter {
+        fn step_started(&mut self, name: &str, _description: &str) {
+            let marker = match name {
+                "cargo build" => "build",
+                "rotate" => "rotate",
+                _ => return,
+            };
+            self.events.borrow_mut().push(marker);
+        }
+    }
+
+    /// Every entry under `dir` with its size and modification time, so a test
+    /// can prove a run neither created nor changed anything.
+    fn tree(
+        dir: &std::path::Path,
+    ) -> Vec<(std::path::PathBuf, u64, Option<std::time::SystemTime>)> {
+        let mut found = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&next) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path.clone());
+                }
+                let metadata = entry.metadata().ok();
+                found.push((
+                    path,
+                    metadata.as_ref().map_or(0, |meta| meta.len()),
+                    metadata.and_then(|meta| meta.modified().ok()),
+                ));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn inserted_steps_run_between_the_default_build_and_rotate() {
+        let dir = temp_workspace("insertion-order");
+        let context = default_plan_context(&dir);
+        let events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let reporter_events = Rc::clone(&events);
+        let start_events = Rc::clone(&events);
+
+        let report = plain_default_builder(&context)
+            .reporter(StepOrderReporter::new(&reporter_events))
+            .insert_after_default_build(marker_step(&events, "stop"))
+            .post(move |_| {
+                start_events.borrow_mut().push("start");
+                Ok(())
+            })
+            .run()
+            .expect("the default plan with one inserted step");
+
+        assert_eq!(
+            *events.borrow(),
+            ["build", "stop", "rotate", "start"],
+            "steps: {:?}",
+            report
+                .steps
+                .iter()
+                .map(|step| &step.name)
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn inserted_steps_keep_their_call_order() {
+        let dir = temp_workspace("insertion-call-order");
+        let context = default_plan_context(&dir);
+        let events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let reporter_events = Rc::clone(&events);
+
+        plain_default_builder(&context)
+            .reporter(StepOrderReporter::new(&reporter_events))
+            .insert_after_default_build(marker_step(&events, "stop-1"))
+            .insert_before_default_rotate(marker_step(&events, "pre-rotate"))
+            .insert_after_default_build(marker_step(&events, "stop-2"))
+            .run()
+            .expect("the default plan with three inserted steps");
+
+        assert_eq!(
+            *events.borrow(),
+            ["build", "stop-1", "stop-2", "pre-rotate", "rotate"]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_default_plan_is_unchanged_without_insertions() {
+        let dir = temp_workspace("insertion-default");
+        let context = default_plan_context(&dir);
+        let events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let reporter_events = Rc::clone(&events);
+
+        let report = plain_default_builder(&context)
+            .reporter(StepOrderReporter::new(&reporter_events))
+            .run()
+            .expect("the default plan");
+
+        assert_eq!(report.steps.len(), 2, "steps: {:?}", report.steps);
+        assert_eq!(*events.borrow(), ["build", "rotate"]);
+
+        // The dry-run plan is exactly the same two lines.
+        let mut dry_run = test_context();
+        dry_run.dry_run = true;
+        let plan = deploy(&dry_run).run().expect("dry-run plan").plan;
+        assert_eq!(plan.len(), 2, "plan: {plan:?}");
+        assert!(plan[0].contains("-p tracel-deploy-test"), "plan: {plan:?}");
+        assert!(plan[1].starts_with("rotate "), "plan: {plan:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn insertion_points_do_not_affect_a_caller_owned_plan() {
+        let dir = temp_workspace("insertion-without-defaults");
+        let context = default_plan_context(&dir);
+        let events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+
+        let report = deploy(&context)
+            .without_defaults()
+            .insert_after_default_build(marker_step(&events, "inserted"))
+            .insert_before_default_rotate(marker_step(&events, "also-inserted"))
+            .step(marker_step(&events, "own"))
+            .run()
+            .expect("a caller-owned plan");
+
+        assert_eq!(report.steps.len(), 1, "steps: {:?}", report.steps);
+        assert_eq!(
+            *events.borrow(),
+            ["own"],
+            "the insertion points shape the default plan only"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cargo_build_command_line_carries_every_option() {
+        let context = test_context();
+        let step = CargoBuildStep {
+            package: "my-service".to_owned(),
+            release: true,
+            cargo: Some(std::path::PathBuf::from("C:/tools/cargo-ds.exe")),
+            profile: Some("dist".to_owned()),
+            locked: true,
+            target: Some("x86_64-pc-windows-msvc".to_owned()),
+            target_dir: Some(std::path::PathBuf::from("D:/cache/target")),
+            features: vec!["a".to_owned(), "b".to_owned()],
+            no_default_features: true,
+            extra_args: vec!["--verbose".to_owned()],
+        };
+
+        let line = step.command_line(&context);
+
+        assert_eq!(
+            line,
+            [
+                "C:/tools/cargo-ds.exe",
+                "build",
+                "-p",
+                "my-service",
+                "--color",
+                "always",
+                "--profile",
+                "dist",
+                "--locked",
+                "--target",
+                "x86_64-pc-windows-msvc",
+                "--target-dir",
+                "D:/cache/target",
+                "--features",
+                "a,b",
+                "--no-default-features",
+                "--verbose",
+            ]
+        );
+        assert!(
+            !line.iter().any(|arg| arg == "--release"),
+            "a custom profile replaces --release: {line:?}"
+        );
+        assert_eq!(
+            DeployStep::CargoBuild(step).describe(&context),
+            line.join(" "),
+            "describe() and the executed command share one source"
+        );
+    }
+
+    #[test]
+    fn cargo_build_command_line_uses_release_without_a_profile() {
+        let context = test_context();
+        let mut step = CargoBuildStep::from_context(&context);
+        step.cargo = Some(std::path::PathBuf::from("cargo"));
+
+        step.release = true;
+        assert!(
+            step.command_line(&context)
+                .contains(&"--release".to_owned()),
+            "line: {:?}",
+            step.command_line(&context)
+        );
+
+        step.release = false;
+        assert!(
+            !step
+                .command_line(&context)
+                .contains(&"--release".to_owned()),
+            "line: {:?}",
+            step.command_line(&context)
+        );
+
+        step.profile = Some("dist".to_owned());
+        let line = step.command_line(&context);
+        assert!(
+            line.windows(2).any(|pair| pair == ["--profile", "dist"]),
+            "line: {line:?}"
+        );
+        assert!(!line.iter().any(|arg| arg == "--release"), "line: {line:?}");
+    }
+
+    #[test]
+    fn cargo_build_executes_the_command_line_it_describes() {
+        let dir = temp_workspace("cargo-command-line");
+        let cargo = fake_cargo(&dir);
+        let context = DeployContext::builder(&dir, "my-service")
+            .quiet(true)
+            .cargo(&cargo)
+            .profile("dist")
+            .locked(true)
+            .target("x86_64-pc-windows-msvc")
+            .target_dir(dir.join("target"))
+            .features(["a", "b"])
+            .no_default_features(true)
+            .build_args(["--verbose"])
+            .build();
+
+        let step = CargoBuildStep::from_context(&context);
+        let described = DeployStep::CargoBuild(step.clone()).describe(&context);
+        let report = step
+            .clone()
+            .run(&context, &mut NullReporter)
+            .expect("the fake cargo succeeds");
+
+        assert_eq!(report.status, StepStatus::Success);
+        let executed = std::fs::read_to_string(dir.join("cargo-args.txt"))
+            .expect("the fake cargo logged its argv");
+        assert_eq!(
+            // `cmd.exe` re-quotes an argument like `a,b` when `%*` is echoed.
+            executed.trim().replace('"', ""),
+            step.command_line(&context)[1..].join(" "),
+            "the executed argv is the described command line"
+        );
+        assert_eq!(described, step.command_line(&context).join(" "));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_deploy_releases_the_lock() {
+        let dir = temp_workspace("failed-deploy-lock");
+        let mut context = test_context();
+        context.state_dir = dir.join("state");
+        let lock_path = context
+            .state_dir
+            .join(format!("{}.deploy.lock", context.binary_name));
+        let held = lock_path.clone();
+
+        let error = deploy(&context)
+            .without_defaults()
+            .step(DeployStep::Custom(Box::new(move |_| {
+                assert!(
+                    held.is_file(),
+                    "the deploy holds the lock while the plan runs: {}",
+                    held.display()
+                );
+                anyhow::bail!("injected step failure")
+            })))
+            .run()
+            .expect_err("the injected failure must surface");
+
+        assert!(format!("{error:#}").contains("injected step failure"));
+        assert!(
+            !lock_path.is_file(),
+            "a failed deploy must not leave {} behind",
+            lock_path.display()
+        );
+        let reacquired =
+            crate::context::DeployLock::acquire(&context.state_dir, &context.binary_name)
+                .expect("the lock is free again after a failure");
+        drop(reacquired);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
