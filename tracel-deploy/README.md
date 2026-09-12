@@ -171,7 +171,7 @@ start -> probe` loop needs, instead of every consumer writing its own pid
 files, detached spawn, and readiness probe:
 
 ```toml
-tracel-deploy = { version = "0.1", features = ["service"] }
+tracel-deploy = { version = "0.2", features = ["service"] }
 ```
 
 - `ServiceSpec` describes one service: name, binary, args, env, cwd, log file,

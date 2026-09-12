@@ -4,7 +4,7 @@
 //! The module is compiled only with the `service` feature (off by default):
 //!
 //! ```toml
-//! tracel-deploy = { version = "0.1", features = ["service"] }
+//! tracel-deploy = { version = "0.2", features = ["service"] }
 //! ```
 //!
 //! It stays deliberately unopinionated about *what* a service is; it records

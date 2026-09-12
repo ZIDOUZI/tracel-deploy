@@ -62,6 +62,28 @@ pub fn run(args: tracel_deploy::DeployCmdArgs, _env: Environment, _ctx: Context)
 
 For a totally custom ordering, use `without_defaults()` and append
 `DeployStep::Run`, `DeployStep::Rotate`, `DeployStep::Custom`, etc.
+Note that the insertion points above only apply to the default plan: a caller
+that uses `without_defaults()` owns the plan and inserts steps itself.
+
+Several binaries in one workspace go through `batch::batch_deploy`: each
+`DeployTarget` (package plus optional binary / install path / backup dir /
+source) gets its own context and default plan, `BatchOptions` carries
+`fail_fast` (default: keep going and report every target) and the usual
+dry-run / force / quiet settings, and `BatchReport` reports one
+`TargetStatus::Succeeded | Failed | Skipped | NotRun` per target.
+
+```rust
+let targets = [
+    DeployTarget::new("mcp-postgres"),
+    DeployTarget::new("mcp-kubernetes").install_to(dir.join("kubernetes-mcp.exe")),
+];
+let report = tracel_deploy::batch::batch_deploy(&workspace, &targets, BatchOptions::new())?;
+if !report.is_success() {
+    for failed in report.failures() {
+        eprintln!("{}: {}", failed.package, failed.error().unwrap_or("failed"));
+    }
+}
+```
 
 The default plan stays in place when steps only need to be *inserted*:
 `insert_after_default_build` and `insert_before_default_rotate` put a step
@@ -182,7 +204,7 @@ start -> probe` loop needs, instead of every consumer writing its own pid
 files, detached spawn, and readiness probe:
 
 ```toml
-tracel-deploy = { version = "0.1", features = ["service"] }
+tracel-deploy = { version = "0.2", features = ["service"] }
 ```
 
 - `ServiceSpec` describes one service: name, binary, args, env, cwd, log file,
@@ -267,6 +289,14 @@ Hooks can be named (`pre_named`, `post_named`, `on_error_named`,
 `DeployReport::hooks`. Best-effort cleanup inside a step can be modelled with
 `RunStep::allow_failure(true)`, which keeps the exit code and the stderr tail in
 the step report.
+
+Preflight hooks (`preflight` / `preflight_named`) are read-only checks that run
+only during a dry run; a real deployment never runs them. A failing check fails
+the dry run with every check that ran plus the rendered plan, and a preflight
+failure produces no side effects. The plan lists hooks in execution order:
+named hooks as `<phase>: <name>` (`pre: stop service`), unnamed as
+`<phase> hook #<n>` (`finally hook #1`); `preflight` lines appear only for a dry
+run.
 
 `--dry-run` renders the full plan without executing any hook or step. Unless
 `quiet` is set, the plan is printed as `would: ...` lines and it is always
