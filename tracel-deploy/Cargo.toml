@@ -9,6 +9,11 @@ description = "Composable deployment and running-binary rotation helpers for tra
 keywords = ["xtask", "deploy", "cargo", "release", "rotate"]
 categories = ["development-tools"]
 
+[features]
+default = []
+# Optional service lifecycle helpers (`stop -> rotate -> start -> probe`).
+service = []
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

@@ -9,7 +9,9 @@ use std::{
 use anyhow::{Context as _, Result};
 
 use crate::{
-    context::{DeployContext, DeployLock, content_matches, file_fingerprint},
+    context::{
+        DeployContext, DeployLock, FileFingerprint, build_inputs_fingerprint, file_fingerprint,
+    },
     rotate::{RotateOptions, RotateOutcome, RotateStrategy, rotate},
 };
 
@@ -188,10 +190,21 @@ impl Default for DeployPlan {
 ///    `context.install_path`.
 ///
 /// Use [`DeployBuilder::without_defaults`] to fully replace the default plan.
+///
+/// The three behaviours the default plan adds around the steps — the
+/// idempotent short-circuit, the install verification, and the deployment
+/// stamp — are controlled by [`DeployBuilder::idempotent_skip`],
+/// [`DeployBuilder::verify_install`], and [`DeployBuilder::write_deploy_stamp`].
+/// They follow the plan by default (on for the default plan, off after
+/// [`without_defaults`](Self::without_defaults)) and can be enabled
+/// explicitly, so a caller-owned plan can opt into them.
 pub struct DeployBuilder<'a> {
     context: &'a DeployContext,
     plan: DeployPlan,
     defaults: bool,
+    idempotent_skip: Option<bool>,
+    verify_install: Option<bool>,
+    write_deploy_stamp: Option<bool>,
     insert_after_build: Vec<DeployStep>,
     insert_before_rotate: Vec<DeployStep>,
 }
@@ -202,6 +215,9 @@ impl<'a> DeployBuilder<'a> {
             context,
             plan: DeployPlan::new(),
             defaults: true,
+            idempotent_skip: None,
+            verify_install: None,
+            write_deploy_stamp: None,
             insert_after_build: Vec::new(),
             insert_before_rotate: Vec::new(),
         }
@@ -332,6 +348,55 @@ impl<'a> DeployBuilder<'a> {
         self
     }
 
+    /// Enable or disable the idempotent short-circuit.
+    ///
+    /// The default follows the plan: on for the default build + rotate plan,
+    /// off after [`without_defaults`](Self::without_defaults) — exactly the
+    /// behaviour of earlier releases. Call it explicitly to opt a caller-owned
+    /// plan into the short-circuit (or to force the default plan to always
+    /// run):
+    ///
+    /// ```ignore
+    /// deploy(&context)
+    ///     .without_defaults()
+    ///     .idempotent_skip(true)
+    ///     .step(DeployStep::CargoBuild(CargoBuildStep::from_context(&context)))
+    ///     .run()?;
+    /// ```
+    ///
+    /// A skip requires the deployment stamp to prove both that the build
+    /// inputs still hash to the recorded value and that the installed binary
+    /// still matches the recorded fingerprint. A changed source tree is never
+    /// skipped just because the previously built binary happens to equal the
+    /// installed one, and a missing or legacy stamp never skips.
+    pub fn idempotent_skip(mut self, enabled: bool) -> Self {
+        self.idempotent_skip = Some(enabled);
+        self
+    }
+
+    /// Enable or disable the install verification after the steps ran.
+    ///
+    /// The default follows the plan (on for the default plan, off after
+    /// [`without_defaults`](Self::without_defaults)). Verification compares the
+    /// built binary with the installed one and fails the deploy on a mismatch;
+    /// it is not part of the skip path.
+    pub fn verify_install(mut self, enabled: bool) -> Self {
+        self.verify_install = Some(enabled);
+        self
+    }
+
+    /// Enable or disable writing the deployment stamp after a successful plan.
+    ///
+    /// The default follows the plan (on for the default plan, off after
+    /// [`without_defaults`](Self::without_defaults)). The stamp records the
+    /// source, destination, and build-input fingerprints plus the install time
+    /// in `state_dir`; a failure to write it only warns, because the deploy
+    /// itself succeeded.
+    pub fn write_deploy_stamp(mut self, enabled: bool) -> Self {
+        self.write_deploy_stamp = Some(enabled);
+        self
+    }
+
     pub fn run(mut self) -> Result<DeployReport> {
         if self.defaults {
             let mut steps = DeployPlan::standard(self.context);
@@ -344,6 +409,9 @@ impl<'a> DeployBuilder<'a> {
             steps.append(&mut self.plan.steps);
             self.plan.steps = steps;
         }
+        let skip_when_unchanged = self.idempotent_skip.unwrap_or(self.defaults);
+        let verify_after_rotate = self.verify_install.unwrap_or(self.defaults);
+        let stamp_after_rotate = self.write_deploy_stamp.unwrap_or(self.defaults);
         let context = self.context;
         let _lock = if context.dry_run {
             None
@@ -353,49 +421,75 @@ impl<'a> DeployBuilder<'a> {
                 &context.binary_name,
             )?)
         };
-        if self.defaults
+        if skip_when_unchanged
             && !context.dry_run
             && let Some(report) = skip_current_report(context)?
         {
             return Ok(report);
         }
         let report = self.plan.run(context)?;
-        if self.defaults && !context.dry_run {
-            verify_install(context)?;
-            if let Err(error) = write_deploy_stamp(context) {
-                eprintln!("warning: deployed, but the deployment stamp was not written: {error:#}");
-            }
+        if !context.dry_run && verify_after_rotate {
+            verify_installed_binary(context)?;
+        }
+        if !context.dry_run
+            && stamp_after_rotate
+            && let Err(error) = write_deploy_stamp(context)
+        {
+            eprintln!("warning: deployed, but the deployment stamp was not written: {error:#}");
         }
         Ok(report)
     }
 }
 
-/// When the installed binary already matches the built source and `force` is
-/// not set, the default plan is skipped without touching the destination.
+/// Idempotent short-circuit: skip the whole plan when the deployment stamp
+/// proves that nothing changed.
+///
+/// A skip requires both halves of the proof:
+///
+/// - the build inputs still hash to the fingerprint recorded by the stamp
+///   (the decision is made *before* the build, so a changed source tree with a
+///   stale build output is never mistaken for "up to date"), and
+/// - the installed binary still matches the fingerprint recorded by the stamp.
+///
+/// `force` disables the short-circuit, a missing stamp never skips, and a
+/// legacy stamp without the build-input fingerprint never skips either.
+///
+/// The returned report describes the skipped work as the default `cargo
+/// build` + `rotate` pair; callers that replaced the plan still get the same
+/// proof of "nothing changed", only the step labels are generic.
 fn skip_current_report(context: &DeployContext) -> Result<Option<DeployReport>> {
-    let source = context.built_binary_path();
     let destination = &context.install_path;
-    if !source.is_file() || !destination.is_file() {
+    if context.force {
         return Ok(None);
     }
-    let matches = content_matches(&source, destination).with_context(|| {
+    let Some(stamp) = read_deploy_stamp(context)? else {
+        return Ok(None);
+    };
+    let (Some(stamped_inputs), Some(stamped_destination)) = (
+        stamp.build_inputs_fingerprint,
+        stamp.destination_fingerprint,
+    ) else {
+        return Ok(None);
+    };
+    if !destination.is_file() {
+        return Ok(None);
+    }
+    if build_inputs_fingerprint(context)? != stamped_inputs {
+        return Ok(None);
+    }
+    let installed = file_fingerprint(destination).with_context(|| {
         format!(
-            "could not compare {} with {}",
-            source.display(),
+            "could not fingerprint installed binary {}",
             destination.display()
         )
     })?;
-    if !matches {
-        return Ok(None);
-    }
-    if context.force {
+    if installed != stamped_destination {
         return Ok(None);
     }
     if !context.quiet {
         println!(
-            "skipping deploy: {} already matches {} (use --force to deploy anyway)",
-            destination.display(),
-            source.display()
+            "skipping deploy: build inputs are unchanged and {} still matches the stamped binary (use --force to deploy anyway)",
+            destination.display()
         );
     }
     Ok(Some(DeployReport {
@@ -406,15 +500,14 @@ fn skip_current_report(context: &DeployContext) -> Result<Option<DeployReport>> 
             DeployStepReport {
                 name: "cargo build".to_owned(),
                 status: StepStatus::Skipped,
-                detail: Some("installed binary already matches the built source".to_owned()),
+                detail: Some("build inputs are unchanged since the last deploy".to_owned()),
             },
             DeployStepReport {
                 name: "rotate".to_owned(),
                 status: StepStatus::Skipped,
                 detail: Some(format!(
-                    "{} already matches {}",
+                    "{} already matches the stamped binary",
                     destination.display(),
-                    source.display()
                 )),
             },
         ],
@@ -423,7 +516,7 @@ fn skip_current_report(context: &DeployContext) -> Result<Option<DeployReport>> 
 }
 
 /// Verify that the rotation installed exactly the source binary.
-fn verify_install(context: &DeployContext) -> Result<()> {
+fn verify_installed_binary(context: &DeployContext) -> Result<()> {
     let source = context.built_binary_path();
     let destination = &context.install_path;
     if !destination.is_file() {
@@ -462,17 +555,83 @@ fn verify_install(context: &DeployContext) -> Result<()> {
     Ok(())
 }
 
-/// Record the deployed fingerprints in `state_dir` for diagnostics.
+/// Path of the deployment stamp inside `state_dir`.
+fn deploy_stamp_path(context: &DeployContext) -> PathBuf {
+    context
+        .state_dir
+        .join(format!("{}.stamp", context.binary_name))
+}
+
+/// Fields of a deployment stamp. A field is `None` when the stamp does not
+/// contain it: stamps written before the build-input fingerprint existed only
+/// carry the source and destination fingerprints.
+#[derive(Debug, Clone, Copy, Default)]
+struct DeployStamp {
+    source_fingerprint: Option<FileFingerprint>,
+    destination_fingerprint: Option<FileFingerprint>,
+    build_inputs_fingerprint: Option<FileFingerprint>,
+}
+
+/// Read the deployment stamp; `Ok(None)` means "no stamp yet" (including an
+/// unreadable one, which is treated as absent rather than fatal).
+fn read_deploy_stamp(context: &DeployContext) -> Result<Option<DeployStamp>> {
+    let path = deploy_stamp_path(context);
+    match fs::read_to_string(&path) {
+        Ok(contents) => Ok(Some(parse_deploy_stamp(&contents))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("could not read deployment stamp {}", path.display())),
+    }
+}
+
+/// Parse a stamp leniently: unknown keys are ignored and missing keys stay
+/// `None`, so old (schema 1) stamps keep parsing and simply never skip.
+fn parse_deploy_stamp(contents: &str) -> DeployStamp {
+    let mut stamp = DeployStamp::default();
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "source_fingerprint" => stamp.source_fingerprint = parse_fingerprint(value),
+            "destination_fingerprint" => stamp.destination_fingerprint = parse_fingerprint(value),
+            "build_inputs_fingerprint" => stamp.build_inputs_fingerprint = parse_fingerprint(value),
+            _ => {}
+        }
+    }
+    stamp
+}
+
+/// Parse the `Display` form of a [`FileFingerprint`] (`size=… hash=0x…`).
+fn parse_fingerprint(value: &str) -> Option<FileFingerprint> {
+    let mut size = None;
+    let mut hash = None;
+    for part in value.split_whitespace() {
+        if let Some(rest) = part.strip_prefix("size=") {
+            size = rest.parse::<u64>().ok();
+        } else if let Some(rest) = part.strip_prefix("hash=") {
+            hash = rest
+                .strip_prefix("0x")
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok());
+        }
+    }
+    Some(FileFingerprint {
+        size: size?,
+        hash: hash?,
+    })
+}
+
+/// Record the deployed fingerprints in `state_dir` for diagnostics and for the
+/// idempotent short-circuit.
 fn write_deploy_stamp(context: &DeployContext) -> Result<()> {
     let source = context.built_binary_path();
     let destination = &context.install_path;
     let source_fingerprint = file_fingerprint(&source)?;
     let destination_fingerprint = file_fingerprint(destination)?;
+    let build_inputs_fingerprint = build_inputs_fingerprint(context)?;
     fs::create_dir_all(&context.state_dir)
         .with_context(|| format!("could not create state dir {}", context.state_dir.display()))?;
-    let path = context
-        .state_dir
-        .join(format!("{}.stamp", context.binary_name));
+    let path = deploy_stamp_path(context);
     let temporary = context
         .state_dir
         .join(format!("{}.stamp.tmp", context.binary_name));
@@ -481,7 +640,7 @@ fn write_deploy_stamp(context: &DeployContext) -> Result<()> {
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
     let contents = format!(
-        "schema=1\nbinary={}\nsource={}\ndestination={}\nsource_fingerprint={source_fingerprint}\ndestination_fingerprint={destination_fingerprint}\ndeployed_at={deployed_at}\n",
+        "schema=2\nbinary={}\nsource={}\ndestination={}\nsource_fingerprint={source_fingerprint}\ndestination_fingerprint={destination_fingerprint}\nbuild_inputs_fingerprint={build_inputs_fingerprint}\ndeployed_at={deployed_at}\n",
         context.binary_name,
         source.display(),
         destination.display()
@@ -686,6 +845,15 @@ impl RotateStep {
         if let Some(dir) = &self.backup_dir {
             line.push_str(&format!(" (backup dir: {})", dir.display()));
         }
+        // Record the strategy (including the Windows degradation of `Atomic`)
+        // so a dry-run plan never promises a guarantee the platform cannot
+        // deliver.
+        line.push_str(&format!(" (strategy: {}", self.strategy.label()));
+        #[cfg(windows)]
+        if self.strategy == RotateStrategy::Atomic {
+            line.push_str(" -> rename-aside on Windows");
+        }
+        line.push(')');
         line
     }
 
@@ -891,9 +1059,9 @@ mod tests {
 
     use super::{
         CargoBuildStep, DeployStep, RunStep, StepStatus, deploy, skip_current_report,
-        verify_install, write_deploy_stamp,
+        verify_installed_binary, write_deploy_stamp,
     };
-    use crate::context::DeployContext;
+    use crate::context::{DeployContext, build_inputs_fingerprint};
 
     fn test_context() -> DeployContext {
         let unique = std::time::SystemTime::now()
@@ -1192,6 +1360,7 @@ mod tests {
             .install_to(&destination)
             .state_dir(dir.join("state"))
             .build();
+        write_deploy_stamp(&context).expect("stamp");
 
         let report = deploy(&context).run().expect("skipped deploy");
 
@@ -1223,6 +1392,7 @@ mod tests {
         std::fs::write(&destination, "same bytes").expect("destination");
         context.source_binary = Some(source);
         context.install_path = destination;
+        write_deploy_stamp(&context).expect("stamp");
 
         assert!(skip_current_report(&context).expect("compare").is_some());
         context.force = true;
@@ -1276,7 +1446,7 @@ mod tests {
         let mut context = test_context();
         context.source_binary = Some(source.clone());
         context.install_path = destination.clone();
-        let error = verify_install(&context).expect_err("mismatch must fail");
+        let error = verify_installed_binary(&context).expect_err("mismatch must fail");
         let text = format!("{error:#}");
         assert!(text.contains("does not match"), "text: {text}");
         assert!(text.contains(&source.display().to_string()), "text: {text}");
@@ -1286,7 +1456,7 @@ mod tests {
         );
 
         std::fs::write(&destination, "new").expect("destination");
-        verify_install(&context).expect("matching fingerprints pass");
+        verify_installed_binary(&context).expect("matching fingerprints pass");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1307,6 +1477,7 @@ mod tests {
         std::fs::write(&destination, "bytes").expect("destination");
 
         let mut context = test_context();
+        context.workspace_root = dir.clone();
         context.state_dir = dir.join("state");
         context.source_binary = Some(source);
         context.install_path = destination;
@@ -1315,10 +1486,278 @@ mod tests {
 
         let stamp = std::fs::read_to_string(context.state_dir.join("tracel-deploy-test.stamp"))
             .expect("stamp file");
-        assert!(stamp.contains("schema=1"), "stamp: {stamp}");
+        assert!(stamp.contains("schema=2"), "stamp: {stamp}");
         assert!(stamp.contains("source_fingerprint="), "stamp: {stamp}");
         assert!(stamp.contains("destination_fingerprint="), "stamp: {stamp}");
+        assert!(
+            stamp.contains(&format!(
+                "build_inputs_fingerprint={}",
+                build_inputs_fingerprint(&context).expect("fingerprint")
+            )),
+            "stamp: {stamp}"
+        );
         assert!(stamp.contains("deployed_at="), "stamp: {stamp}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Temp directory with unique name for one test.
+    fn temp_workspace(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "tracel-deploy-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// A workspace with build inputs, a matching built/installed "binary" and
+    /// a freshly written deployment stamp.
+    fn stamped_workspace(label: &str) -> (std::path::PathBuf, DeployContext) {
+        let dir = temp_workspace(label);
+        std::fs::create_dir_all(dir.join("src")).expect("src dir");
+        // Deliberately not the deployed package: `cargo build -p
+        // tracel-deploy-test` must fail fast when the plan really runs.
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"other-package\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").expect("source file");
+        let source = dir.join("built-binary");
+        let destination = dir.join("installed");
+        std::fs::write(&source, "built bytes").expect("built binary");
+        std::fs::write(&destination, "built bytes").expect("installed binary");
+
+        let context = DeployContext::builder(&dir, "tracel-deploy-test")
+            .quiet(true)
+            .source(&source)
+            .install_to(&destination)
+            .state_dir(dir.join("state"))
+            .build();
+        write_deploy_stamp(&context).expect("stamp");
+        (dir, context)
+    }
+
+    #[test]
+    fn changed_build_inputs_are_not_skipped() {
+        let (dir, context) = stamped_workspace("skip-changed-inputs");
+        std::fs::write(dir.join("src/main.rs"), "fn main() { /* changed */ }\n").expect("edit");
+
+        assert!(
+            skip_current_report(&context).expect("compare").is_none(),
+            "source changed after the stamp was written; the plan must not be skipped"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_or_legacy_stamps_do_not_skip() {
+        let (dir, context) = stamped_workspace("skip-missing-stamp");
+        let stamp = context
+            .state_dir
+            .join(format!("{}.stamp", context.binary_name));
+        std::fs::remove_file(&stamp).expect("remove stamp");
+        assert!(
+            skip_current_report(&context).expect("compare").is_none(),
+            "a missing stamp must not skip"
+        );
+
+        std::fs::create_dir_all(&context.state_dir).expect("state dir");
+        std::fs::write(
+            &stamp,
+            "schema=1\nbinary=tracel-deploy-test\nsource_fingerprint=size=4 hash=0x1\ndestination_fingerprint=size=4 hash=0x1\ndeployed_at=0\n",
+        )
+        .expect("legacy stamp");
+        assert!(
+            skip_current_report(&context).expect("compare").is_none(),
+            "a legacy stamp without build inputs must not skip"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn changed_build_inputs_run_the_default_plan() {
+        let (dir, context) = stamped_workspace("run-changed-inputs");
+        std::fs::write(dir.join("src/main.rs"), "fn main() { /* changed */ }\n").expect("edit");
+
+        let error = deploy(&context)
+            .run()
+            .expect_err("changed build inputs must run the plan");
+        let text = format!("{error:#}");
+        assert!(text.contains("cargo build"), "text: {text}");
+        assert_eq!(
+            std::fs::read_to_string(&context.install_path).expect("destination"),
+            "built bytes",
+            "a failed plan must not touch the installed binary"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn installed_artifact_drift_is_not_skipped() {
+        let (dir, context) = stamped_workspace("skip-drifted-install");
+        std::fs::write(&context.install_path, "tampered").expect("tamper");
+
+        assert!(
+            skip_current_report(&context).expect("compare").is_none(),
+            "an installed binary that differs from the stamp must not skip"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn force_runs_the_default_plan_even_when_nothing_changed() {
+        let (dir, context) = stamped_workspace("force-run");
+        let mut forced = context.clone();
+        forced.force = true;
+
+        let error = deploy(&forced)
+            .run()
+            .expect_err("force must run the plan even when nothing changed");
+        let text = format!("{error:#}");
+        assert!(text.contains("cargo build"), "text: {text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn default_plan_switches_can_disable_the_skip() {
+        let (dir, context) = stamped_workspace("switches-off");
+
+        let error = deploy(&context)
+            .idempotent_skip(false)
+            .run()
+            .expect_err("disabling the skip must run the build");
+        let text = format!("{error:#}");
+        assert!(text.contains("cargo build"), "text: {text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn without_defaults_idempotent_skip_skips_unchanged_work() {
+        let (dir, context) = stamped_workspace("without-defaults-skip");
+        let ran = Rc::new(RefCell::new(false));
+        let step_ran = Rc::clone(&ran);
+
+        let report = deploy(&context)
+            .without_defaults()
+            .idempotent_skip(true)
+            .step(DeployStep::Custom(Box::new(move |_| {
+                *step_ran.borrow_mut() = true;
+                Ok(())
+            })))
+            .run()
+            .expect("skipped plan");
+
+        assert!(
+            !*ran.borrow(),
+            "the custom step must not run when the deploy is skipped"
+        );
+        assert!(
+            report
+                .steps
+                .iter()
+                .all(|step| step.status == StepStatus::Skipped),
+            "steps: {:?}",
+            report.steps
+        );
+        assert_eq!(
+            std::fs::read_to_string(&context.install_path).expect("installed"),
+            "built bytes"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn without_defaults_keeps_the_old_behaviour_without_explicit_switches() {
+        let (dir, context) = stamped_workspace("without-defaults-legacy");
+        let ran = Rc::new(RefCell::new(false));
+        let step_ran = Rc::clone(&ran);
+        let stamp = context
+            .state_dir
+            .join(format!("{}.stamp", context.binary_name));
+        std::fs::remove_file(&stamp).expect("remove stamp");
+
+        deploy(&context)
+            .without_defaults()
+            .step(DeployStep::Custom(Box::new(move |_| {
+                *step_ran.borrow_mut() = true;
+                Ok(())
+            })))
+            .run()
+            .expect("plan without defaults");
+
+        assert!(
+            *ran.borrow(),
+            "a caller-owned plan keeps running its steps and is not skipped"
+        );
+        assert!(!stamp.exists(), "no stamp is written by default");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn without_defaults_verify_install_checks_the_installed_binary() {
+        let (dir, context) = stamped_workspace("without-defaults-verify");
+        std::fs::write(&context.install_path, "drifted").expect("drift");
+
+        let error = deploy(&context)
+            .without_defaults()
+            .idempotent_skip(true)
+            .verify_install(true)
+            .step(DeployStep::Custom(Box::new(|_| Ok(()))))
+            .run()
+            .expect_err("verification must fail on a drifted install");
+        let text = format!("{error:#}");
+        assert!(text.contains("does not match"), "text: {text}");
+
+        deploy(&context)
+            .without_defaults()
+            .idempotent_skip(true)
+            .verify_install(false)
+            .step(DeployStep::Custom(Box::new(|_| Ok(()))))
+            .run()
+            .expect("verification is switched off");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn without_defaults_write_deploy_stamp_records_build_inputs() {
+        let (dir, context) = stamped_workspace("without-defaults-stamp");
+        let stamp = context
+            .state_dir
+            .join(format!("{}.stamp", context.binary_name));
+        std::fs::remove_file(&stamp).expect("remove stamp");
+
+        deploy(&context)
+            .without_defaults()
+            .idempotent_skip(true)
+            .write_deploy_stamp(true)
+            .step(DeployStep::Custom(Box::new(|_| Ok(()))))
+            .run()
+            .expect("plan without a stamp");
+
+        let contents = std::fs::read_to_string(&stamp).expect("stamp file");
+        assert!(contents.contains("schema=2"), "stamp: {contents}");
+        assert!(
+            contents.contains(&format!(
+                "build_inputs_fingerprint={}",
+                build_inputs_fingerprint(&context).expect("fingerprint")
+            )),
+            "stamp: {contents}"
+        );
+
+        std::fs::remove_file(&stamp).expect("remove stamp");
+        deploy(&context)
+            .without_defaults()
+            .idempotent_skip(true)
+            .write_deploy_stamp(false)
+            .step(DeployStep::Custom(Box::new(|_| Ok(()))))
+            .run()
+            .expect("plan without the stamp switch");
+        assert!(!stamp.exists(), "the stamp must not be written");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

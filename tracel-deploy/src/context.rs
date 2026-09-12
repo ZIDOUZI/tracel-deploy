@@ -417,13 +417,24 @@ impl std::fmt::Display for FileFingerprint {
     }
 }
 
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Mix `bytes` into an FNV-1a 64 hash. Non-cryptographic change detection only.
+fn fnv1a_64(bytes: &[u8], hash: &mut u64) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+}
+
 /// Fingerprint a file by reading it in chunks.
 pub fn file_fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
     use std::io::Read;
 
     let mut file = fs::File::open(path)?;
     let mut buffer = [0_u8; 8192];
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut hash: u64 = FNV_OFFSET_BASIS;
     let mut size = 0_u64;
     loop {
         let read = file.read(&mut buffer)?;
@@ -431,10 +442,7 @@ pub fn file_fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
             break;
         }
         size += read as u64;
-        for byte in &buffer[..read] {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        fnv1a_64(&buffer[..read], &mut hash);
     }
     Ok(FileFingerprint { size, hash })
 }
@@ -442,6 +450,124 @@ pub fn file_fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
 /// True when both files exist and have identical size and content hash.
 pub fn content_matches(left: &Path, right: &Path) -> std::io::Result<bool> {
     Ok(file_fingerprint(left)? == file_fingerprint(right)?)
+}
+
+/// Build inputs of [`build_inputs_fingerprint`], relative to the workspace
+/// root. An entry may be a file or a directory; missing entries are skipped.
+pub const DEFAULT_BUILD_INPUTS: &[&str] = &[
+    "src",
+    "Cargo.toml",
+    "Cargo.lock",
+    "build.rs",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+    ".cargo/config.toml",
+];
+
+/// Fingerprint of everything that can change the built binary: the `src` tree,
+/// manifests, the lockfile, the build script, the toolchain pin, and the cargo
+/// config ([`DEFAULT_BUILD_INPUTS`]).
+///
+/// This answers "were the sources touched since the last deploy?", which is a
+/// different question from [`file_fingerprint`] on the built binary ("does the
+/// build output differ from the installed binary?"). A deploy stamp that
+/// records this fingerprint can therefore tell a changed source tree apart
+/// from a stale build output.
+///
+/// Missing inputs are skipped, so a crate without `build.rs`, a lockfile, or a
+/// toolchain pin still gets a stable fingerprint.
+pub fn build_inputs_fingerprint(context: &DeployContext) -> Result<FileFingerprint> {
+    build_inputs_fingerprint_with(context, DEFAULT_BUILD_INPUTS)
+}
+
+/// Like [`build_inputs_fingerprint`], with an explicit input list.
+///
+/// Entries are resolved against [`DeployContext::workspace_root`] unless they
+/// are absolute. Directories are walked recursively and missing entries are
+/// skipped, so callers can pass whole source trees next to single files. The
+/// result does not depend on the enumeration order, on the absolute location
+/// of the checkout, or on an entry being listed twice.
+pub fn build_inputs_fingerprint_with<P>(
+    context: &DeployContext,
+    inputs: &[P],
+) -> Result<FileFingerprint>
+where
+    P: AsRef<Path>,
+{
+    let root = &context.workspace_root;
+    let mut files = Vec::new();
+    for input in inputs {
+        collect_build_inputs(root, input.as_ref(), &mut files)?;
+    }
+    let mut entries = files
+        .iter()
+        .map(|path| (relative_input_name(root, path), path))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries.dedup_by(|left, right| left.0 == right.0);
+
+    let mut hash = FNV_OFFSET_BASIS;
+    let mut size = 0_u64;
+    for (name, path) in entries {
+        let fingerprint = file_fingerprint(path)
+            .with_context(|| format!("could not fingerprint build input {}", path.display()))?;
+        size += fingerprint.size;
+        fnv1a_64(name.as_bytes(), &mut hash);
+        fnv1a_64(&[0], &mut hash);
+        fnv1a_64(&fingerprint.size.to_le_bytes(), &mut hash);
+        fnv1a_64(&fingerprint.hash.to_le_bytes(), &mut hash);
+    }
+    Ok(FileFingerprint { size, hash })
+}
+
+/// Collect the files behind one build input: a file is taken as is, a
+/// directory is walked recursively, and a missing entry is skipped.
+///
+/// Directory symlinks are not followed, so a cycle cannot hang the walk.
+fn collect_build_inputs(root: &Path, input: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    let path = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        root.join(input)
+    };
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not read build input {}", path.display()));
+        }
+    };
+    if !metadata.is_dir() {
+        files.push(path);
+        return Ok(());
+    }
+    let entries = fs::read_dir(&path)
+        .with_context(|| format!("could not list build input {}", path.display()))?;
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("could not list build input {}", path.display()))?;
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("could not read build input {}", entry_path.display()))?;
+        if file_type.is_dir() {
+            collect_build_inputs(root, &entry_path, files)?;
+        } else if file_type.is_file() || entry_path.is_file() {
+            // `is_file` follows symlinks: symlinked files are hashed, symlinked
+            // directories are skipped.
+            files.push(entry_path);
+        }
+    }
+    Ok(())
+}
+
+/// Stable name of a build input: relative to the workspace root where possible
+/// and always `/`-separated, so the fingerprint does not depend on where the
+/// checkout lives or on the platform path separator.
+fn relative_input_name(root: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    relative.to_string_lossy().replace('\\', "/")
 }
 
 /// Deployment lock stored inside the context `state_dir`.
@@ -521,7 +647,10 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{DeployContext, binary_name_with_extension, content_matches, file_fingerprint};
+    use super::{
+        DeployContext, binary_name_with_extension, build_inputs_fingerprint,
+        build_inputs_fingerprint_with, content_matches, file_fingerprint,
+    };
 
     /// Serializes the tests that mutate process-wide cargo environment
     /// variables.
@@ -664,6 +793,92 @@ mod tests {
 
         fs::write(&right, "different").expect("right");
         assert!(!content_matches(&left, &right).expect("compare"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn build_inputs_fingerprint_is_stable_and_order_independent() {
+        let dir = temp_dir("build-inputs");
+        fs::create_dir_all(dir.join("src/nested")).expect("src tree");
+        fs::write(dir.join("Cargo.toml"), "[package]\n").expect("manifest");
+        fs::write(dir.join("Cargo.lock"), "lock").expect("lockfile");
+        fs::write(dir.join("build.rs"), "fn main() {}").expect("build script");
+        fs::write(dir.join("src/main.rs"), "fn main() {}\n").expect("main");
+        fs::write(dir.join("src/nested/mod.rs"), "mod nested;\n").expect("nested");
+        let context = DeployContext::new(&dir, "demo");
+
+        let fingerprint = build_inputs_fingerprint(&context).expect("fingerprint");
+        let expected_size = ("[package]\n".len()
+            + "lock".len()
+            + "fn main() {}".len()
+            + "fn main() {}\n".len()
+            + "mod nested;\n".len()) as u64;
+        assert_eq!(fingerprint.size, expected_size);
+
+        // The same inputs in another order, plus inputs that do not exist.
+        let reordered = build_inputs_fingerprint_with(
+            &context,
+            &[
+                "src",
+                "Cargo.lock",
+                "missing",
+                "rust-toolchain",
+                ".cargo/config.toml",
+                "Cargo.toml",
+                "build.rs",
+                "rust-toolchain.toml",
+            ],
+        )
+        .expect("fingerprint");
+        assert_eq!(fingerprint, reordered);
+
+        // Listing a file twice (here through `src` and `src/main.rs`) is stable.
+        let duplicated = build_inputs_fingerprint_with(
+            &context,
+            &["src", "src/main.rs", "Cargo.toml", "Cargo.lock", "build.rs"],
+        )
+        .expect("fingerprint");
+        assert_eq!(fingerprint, duplicated);
+
+        // A workspace without any of the default inputs has an empty fingerprint.
+        let empty_dir = temp_dir("build-inputs-empty");
+        let empty =
+            build_inputs_fingerprint(&DeployContext::new(&empty_dir, "demo")).expect("fingerprint");
+        assert_eq!(empty.size, 0);
+        assert_ne!(empty.hash, 0);
+
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(empty_dir);
+    }
+
+    #[test]
+    fn build_inputs_fingerprint_tracks_added_removed_and_changed_files() {
+        let dir = temp_dir("build-inputs-changes");
+        fs::create_dir_all(dir.join("src")).expect("src tree");
+        fs::write(dir.join("src/main.rs"), "fn main() {}\n").expect("main");
+        fs::write(dir.join("src/lib.rs"), "pub fn lib() {}\n").expect("lib");
+        let context = DeployContext::new(&dir, "demo");
+        let initial = build_inputs_fingerprint(&context).expect("fingerprint");
+
+        fs::write(dir.join("src/main.rs"), "fn main() { }\n").expect("edit");
+        let changed = build_inputs_fingerprint(&context).expect("fingerprint");
+        assert_ne!(initial, changed, "a content change must change the hash");
+
+        fs::write(dir.join("src/extra.rs"), "pub fn extra() {}\n").expect("add");
+        let added = build_inputs_fingerprint(&context).expect("fingerprint");
+        assert_ne!(changed, added, "an added file must change the hash");
+
+        fs::remove_file(dir.join("src/extra.rs")).expect("remove added file");
+        let restored = build_inputs_fingerprint(&context).expect("fingerprint");
+        assert_eq!(
+            changed, restored,
+            "removing the added file restores the hash"
+        );
+
+        fs::remove_file(dir.join("src/lib.rs")).expect("remove file");
+        let removed = build_inputs_fingerprint(&context).expect("fingerprint");
+        assert_ne!(changed, removed, "a removed file must change the hash");
+
         let _ = fs::remove_dir_all(dir);
     }
 }

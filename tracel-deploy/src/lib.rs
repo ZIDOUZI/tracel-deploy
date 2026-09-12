@@ -19,10 +19,12 @@ pub mod command;
 pub mod context;
 pub mod plan;
 pub mod rotate;
+pub mod service;
 
 pub use command::DeployCmdArgs;
 pub use context::{
-    DeployContext, DeployContextBuilder, DeployLock, FileFingerprint, Profile, content_matches,
+    DEFAULT_BUILD_INPUTS, DeployContext, DeployContextBuilder, DeployLock, FileFingerprint,
+    Profile, build_inputs_fingerprint, build_inputs_fingerprint_with, content_matches,
     file_fingerprint,
 };
 pub use plan::{
@@ -39,12 +41,20 @@ pub mod __private {
 }
 
 pub mod prelude {
+    pub use crate::context::DEFAULT_BUILD_INPUTS;
+    #[cfg(feature = "service")]
+    pub use crate::service::{
+        Instance, ProbeKind, ProbeReport, ProbeSpec, ServiceSpec, ServiceState, StopOutcome,
+        StopReport, executable_path, find_running_instance, is_alive, probe_once, resolve_binary,
+        start_and_wait_ready, start_detached, stop, stop_checked, stop_service, tail_log,
+        wait_ready,
+    };
     pub use crate::{
         CargoBuildStep, DeployBuilder, DeployCmdArgs, DeployContext, DeployContextBuilder,
         DeployHook, DeployHookEntry, DeployHookReport, DeployLock, DeployPlan, DeployReport,
         DeployStep, DeployStepReport, FileFingerprint, Profile, RotateOptions, RotateOutcome,
-        RotateStep, RotateStrategy, RunStep, StepStatus, content_matches, deploy, file_fingerprint,
-        rotate,
+        RotateStep, RotateStrategy, RunStep, StepStatus, build_inputs_fingerprint,
+        build_inputs_fingerprint_with, content_matches, deploy, file_fingerprint, rotate,
     };
     pub use tracel_deploy_macros::deploy_commands;
     pub use tracel_xtask::prelude::{Context, Environment, XtaskArgs};
