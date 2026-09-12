@@ -20,6 +20,7 @@ pub mod context;
 pub mod plan;
 pub mod rotate;
 pub mod service;
+pub mod state;
 
 pub use command::DeployCmdArgs;
 pub use context::{
@@ -29,9 +30,16 @@ pub use context::{
 };
 pub use plan::{
     CargoBuildStep, DeployBuilder, DeployHook, DeployHookEntry, DeployHookReport, DeployPlan,
-    DeployReport, DeployStep, DeployStepReport, RotateStep, RunStep, StepStatus, deploy,
+    DeployReport, DeployStep, DeployStepReport, NullReporter, Reporter, RotateStep, RunOutcome,
+    RunStep, StdoutReporter, StepStatus, StepVerify, deploy,
 };
-pub use rotate::{RotateOptions, RotateOutcome, RotateStrategy, rotate};
+pub use rotate::{
+    BackupRetry, CleanupReport, DiscardedPending, PendingBackup, PendingDropReason, RotateOptions,
+    RotateOutcome, RotateStrategy, cleanup_pending_backups, rotate,
+};
+pub use state::{
+    read_state_file, remove_state_file, resolve_install_path, same_file_path, write_state_file,
+};
 pub use tracel_deploy_macros::deploy_commands;
 
 #[doc(hidden)]
@@ -42,6 +50,7 @@ pub mod __private {
 
 pub mod prelude {
     pub use crate::context::DEFAULT_BUILD_INPUTS;
+    pub use crate::rotate::{BackupRetry, CleanupReport, cleanup_pending_backups};
     #[cfg(feature = "service")]
     pub use crate::service::{
         Instance, ProbeKind, ProbeReport, ProbeSpec, ServiceSpec, ServiceState, StopOutcome,
@@ -52,9 +61,11 @@ pub mod prelude {
     pub use crate::{
         CargoBuildStep, DeployBuilder, DeployCmdArgs, DeployContext, DeployContextBuilder,
         DeployHook, DeployHookEntry, DeployHookReport, DeployLock, DeployPlan, DeployReport,
-        DeployStep, DeployStepReport, FileFingerprint, Profile, RotateOptions, RotateOutcome,
-        RotateStep, RotateStrategy, RunStep, StepStatus, build_inputs_fingerprint,
-        build_inputs_fingerprint_with, content_matches, deploy, file_fingerprint, rotate,
+        DeployStep, DeployStepReport, FileFingerprint, NullReporter, Profile, Reporter,
+        RotateOptions, RotateOutcome, RotateStep, RotateStrategy, RunOutcome, RunStep,
+        StdoutReporter, StepStatus, build_inputs_fingerprint, build_inputs_fingerprint_with,
+        content_matches, deploy, file_fingerprint, read_state_file, remove_state_file,
+        resolve_install_path, rotate, same_file_path, write_state_file,
     };
     pub use tracel_deploy_macros::deploy_commands;
     pub use tracel_xtask::prelude::{Context, Environment, XtaskArgs};

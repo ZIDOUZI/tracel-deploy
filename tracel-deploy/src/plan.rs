@@ -1,9 +1,11 @@
 use std::{
-    fs,
+    fmt, fs,
     io::Read,
     path::PathBuf,
-    process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::Arc,
+    thread::JoinHandle,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result};
@@ -33,6 +35,144 @@ impl DeployHookEntry {
             .clone()
             .unwrap_or_else(|| format!("{phase} hook #{}", index + 1))
     }
+}
+
+/// Where a deploy plan sends its human-readable output.
+///
+/// Every message the library prints goes through a reporter: a
+/// [`StdoutReporter`] by default (the 0.1.0 output), a [`NullReporter`] for a
+/// fully silent deploy, or a caller-owned implementation for logs, structured
+/// events, or a CI summary. [`DeployBuilder::reporter`] injects one.
+///
+/// Every method has a no-op default, so an implementation can react to only the
+/// events it cares about. An injected reporter replaces the `quiet` handling:
+/// it runs even for a context with `quiet` set.
+///
+/// ```ignore
+/// use tracel_deploy::plan::{DeployStepReport, Reporter};
+///
+/// #[derive(Default)]
+/// struct Summary {
+///     steps: Vec<String>,
+/// }
+///
+/// impl Reporter for Summary {
+///     fn step_finished(&mut self, report: &DeployStepReport) {
+///         self.steps.push(format!("{}: {:?}", report.name, report.status));
+///     }
+/// }
+///
+/// tracel_deploy::deploy(&context)
+///     .reporter(Summary::default())
+///     .run()?;
+/// ```
+pub trait Reporter {
+    /// The dry-run plan: one line per step that would run, the same lines as
+    /// [`DeployReport::plan`]. [`StdoutReporter`] renders each line as
+    /// `would: <line>` unless it is quiet.
+    fn plan(&mut self, lines: &[String]) {
+        let _ = lines;
+    }
+
+    /// A step is about to run. `description` is the single line of
+    /// [`DeployStep::describe`]; `name` is the name the step reports itself
+    /// under, for example `cargo build` or `run my-service`.
+    ///
+    /// [`StdoutReporter`] prints nothing here: the steps that echoed a line in
+    /// 0.1.0 report that line through [`Reporter::note`] instead, so a reporter
+    /// that prints both would print it twice.
+    fn step_started(&mut self, name: &str, description: &str) {
+        let _ = (name, description);
+    }
+
+    /// A message without step context: the cargo command line and the `run …`
+    /// description a step echoes before it runs, and the idempotent-skip
+    /// notice. [`StdoutReporter`] prints these lines to stdout unless it is
+    /// quiet.
+    fn note(&mut self, message: &str) {
+        let _ = message;
+    }
+
+    /// A step finished and produced a report; a step that failed returns an
+    /// error instead, so no report reaches the reporter.
+    fn step_finished(&mut self, report: &DeployStepReport) {
+        let _ = report;
+    }
+
+    /// A non-fatal problem: the deploy succeeded but something around it did
+    /// not (for example a deployment stamp that could not be written).
+    /// [`StdoutReporter`] writes these to stderr and `quiet` does not suppress
+    /// them; use [`NullReporter`] for complete silence.
+    fn warning(&mut self, message: &str) {
+        let _ = message;
+    }
+}
+
+/// The default reporter: the stdout behaviour of 0.1.0.
+///
+/// The cargo command line, the `run …` description, and the skip notice are
+/// printed to stdout, the dry-run plan as `would: <line>` lines, and warnings
+/// to stderr. A quiet reporter suppresses every stdout line (that is what
+/// `DeployContext::quiet` maps onto) but still writes warnings to stderr.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StdoutReporter {
+    quiet: bool,
+}
+
+impl StdoutReporter {
+    /// A reporter that prints the deploy progress.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A reporter that prints nothing to stdout, like a context with `quiet`.
+    pub fn quiet() -> Self {
+        Self { quiet: true }
+    }
+
+    /// Map a `quiet` flag (for example [`DeployContext::quiet`]) onto a
+    /// reporter.
+    pub fn with_quiet(quiet: bool) -> Self {
+        Self { quiet }
+    }
+
+    /// Whether the stdout lines are suppressed.
+    pub fn is_quiet(&self) -> bool {
+        self.quiet
+    }
+}
+
+impl Reporter for StdoutReporter {
+    fn plan(&mut self, lines: &[String]) {
+        if self.quiet {
+            return;
+        }
+        for line in lines {
+            println!("would: {line}");
+        }
+    }
+
+    fn note(&mut self, message: &str) {
+        if !self.quiet {
+            println!("{message}");
+        }
+    }
+
+    fn warning(&mut self, message: &str) {
+        eprintln!("warning: {message}");
+    }
+}
+
+/// A reporter that discards every message: a fully silent deploy for a caller
+/// that consumes [`DeployReport`] (or the exit status) instead of the output.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NullReporter;
+
+impl Reporter for NullReporter {}
+
+/// The reporter used when the caller does not inject one.
+fn default_reporter(context: &DeployContext) -> StdoutReporter {
+    StdoutReporter::with_quiet(context.quiet)
 }
 
 /// A composable deployment plan.
@@ -84,6 +224,19 @@ impl DeployPlan {
     }
 
     pub fn run(self, context: &DeployContext) -> Result<DeployReport> {
+        let mut reporter = default_reporter(context);
+        self.run_with(context, &mut reporter)
+    }
+
+    /// Like [`run`](Self::run) but sends every message to `reporter`.
+    ///
+    /// The injected reporter also runs for a context with `quiet` set; it is
+    /// the caller's decision what to do with the messages then.
+    pub fn run_with(
+        self,
+        context: &DeployContext,
+        reporter: &mut dyn Reporter,
+    ) -> Result<DeployReport> {
         let mut report = DeployReport {
             installed: context.install_path.clone(),
             dry_run: context.dry_run,
@@ -93,11 +246,7 @@ impl DeployPlan {
         };
         if context.dry_run {
             report.plan = self.render(context);
-            if !context.quiet {
-                for line in &report.plan {
-                    println!("would: {line}");
-                }
-            }
+            reporter.plan(&report.plan);
             return Ok(report);
         }
 
@@ -115,7 +264,7 @@ impl DeployPlan {
 
         if !failed {
             for step in steps {
-                match step.run(context) {
+                match step.run(context, reporter) {
                     Ok(step_report) => report.steps.push(step_report),
                     Err(error) => {
                         failures.push(error);
@@ -207,6 +356,7 @@ pub struct DeployBuilder<'a> {
     write_deploy_stamp: Option<bool>,
     insert_after_build: Vec<DeployStep>,
     insert_before_rotate: Vec<DeployStep>,
+    reporter: Option<Box<dyn Reporter>>,
 }
 
 impl<'a> DeployBuilder<'a> {
@@ -220,7 +370,19 @@ impl<'a> DeployBuilder<'a> {
             write_deploy_stamp: None,
             insert_after_build: Vec::new(),
             insert_before_rotate: Vec::new(),
+            reporter: None,
         }
+    }
+
+    /// Send the deploy output to `reporter` instead of the default
+    /// [`StdoutReporter`].
+    ///
+    /// The injected reporter replaces the `quiet` handling, so a caller that
+    /// wants a silent deploy passes [`NullReporter`] and a caller that wants
+    /// structured events implements [`Reporter`].
+    pub fn reporter(mut self, reporter: impl Reporter + 'static) -> Self {
+        self.reporter = Some(Box::new(reporter));
+        self
     }
 
     /// Add an unnamed hook that runs before the deployment steps. The usual
@@ -413,6 +575,9 @@ impl<'a> DeployBuilder<'a> {
         let verify_after_rotate = self.verify_install.unwrap_or(self.defaults);
         let stamp_after_rotate = self.write_deploy_stamp.unwrap_or(self.defaults);
         let context = self.context;
+        let mut reporter: Box<dyn Reporter> = self
+            .reporter
+            .unwrap_or_else(|| Box::new(default_reporter(context)));
         let _lock = if context.dry_run {
             None
         } else {
@@ -425,9 +590,13 @@ impl<'a> DeployBuilder<'a> {
             && !context.dry_run
             && let Some(report) = skip_current_report(context)?
         {
+            reporter.note(&format!(
+                "skipping deploy: build inputs are unchanged and {} still matches the stamped binary (use --force to deploy anyway)",
+                context.install_path.display()
+            ));
             return Ok(report);
         }
-        let report = self.plan.run(context)?;
+        let report = self.plan.run_with(context, reporter.as_mut())?;
         if !context.dry_run && verify_after_rotate {
             verify_installed_binary(context)?;
         }
@@ -435,7 +604,9 @@ impl<'a> DeployBuilder<'a> {
             && stamp_after_rotate
             && let Err(error) = write_deploy_stamp(context)
         {
-            eprintln!("warning: deployed, but the deployment stamp was not written: {error:#}");
+            reporter.warning(&format!(
+                "deployed, but the deployment stamp was not written: {error:#}"
+            ));
         }
         Ok(report)
     }
@@ -486,12 +657,8 @@ fn skip_current_report(context: &DeployContext) -> Result<Option<DeployReport>> 
     if installed != stamped_destination {
         return Ok(None);
     }
-    if !context.quiet {
-        println!(
-            "skipping deploy: build inputs are unchanged and {} still matches the stamped binary (use --force to deploy anyway)",
-            destination.display()
-        );
-    }
+    // The skip notice is printed by the caller through the reporter, so that
+    // this function stays free of output.
     Ok(Some(DeployReport {
         installed: destination.clone(),
         dry_run: false,
@@ -501,6 +668,9 @@ fn skip_current_report(context: &DeployContext) -> Result<Option<DeployReport>> 
                 name: "cargo build".to_owned(),
                 status: StepStatus::Skipped,
                 detail: Some("build inputs are unchanged since the last deploy".to_owned()),
+                duration: None,
+                exit_code: None,
+                artifacts: Vec::new(),
             },
             DeployStepReport {
                 name: "rotate".to_owned(),
@@ -509,6 +679,9 @@ fn skip_current_report(context: &DeployContext) -> Result<Option<DeployReport>> 
                     "{} already matches the stamped binary",
                     destination.display(),
                 )),
+                duration: None,
+                exit_code: None,
+                artifacts: Vec::new(),
             },
         ],
         hooks: Vec::new(),
@@ -688,17 +861,44 @@ impl DeployStep {
         }
     }
 
-    fn run(self, context: &DeployContext) -> Result<DeployStepReport> {
+    /// The name this step reports itself under.
+    fn name(&self) -> String {
         match self {
-            Self::CargoBuild(step) => step.run(context),
-            Self::Rotate(step) => step.run(context),
-            Self::Run(step) => step.run(context),
+            Self::CargoBuild(_) => "cargo build".to_owned(),
+            Self::Rotate(_) => "rotate".to_owned(),
+            Self::Run(step) => format!("run {}", step.program.display()),
+            Self::Custom(_) => "custom".to_owned(),
+        }
+    }
+
+    fn run(self, context: &DeployContext, reporter: &mut dyn Reporter) -> Result<DeployStepReport> {
+        let name = self.name();
+        reporter.step_started(&name, &self.describe(context));
+        let started = Instant::now();
+        let mut report = self.run_inner(context, reporter)?;
+        report.duration = Some(started.elapsed());
+        reporter.step_finished(&report);
+        Ok(report)
+    }
+
+    fn run_inner(
+        self,
+        context: &DeployContext,
+        reporter: &mut dyn Reporter,
+    ) -> Result<DeployStepReport> {
+        match self {
+            Self::CargoBuild(step) => step.run(context, reporter),
+            Self::Rotate(step) => step.run(context, reporter),
+            Self::Run(step) => step.run(context, reporter),
             Self::Custom(mut step) => {
                 step(context).with_context(|| "step 'custom' failed")?;
                 Ok(DeployStepReport {
                     name: "custom".to_owned(),
                     status: StepStatus::Success,
                     detail: None,
+                    duration: None,
+                    exit_code: None,
+                    artifacts: Vec::new(),
                 })
             }
         }
@@ -781,12 +981,10 @@ impl CargoBuildStep {
         line
     }
 
-    fn run(self, context: &DeployContext) -> Result<DeployStepReport> {
+    fn run(self, context: &DeployContext, reporter: &mut dyn Reporter) -> Result<DeployStepReport> {
         let line = self.command_line(context);
         let command = line.join(" ");
-        if !context.quiet {
-            println!("{command}");
-        }
+        reporter.note(&command);
         let status = Command::new(&line[0])
             .current_dir(&context.workspace_root)
             .args(&line[1..])
@@ -809,6 +1007,9 @@ impl CargoBuildStep {
             name: "cargo build".to_owned(),
             status: StepStatus::Success,
             detail: Some(self.package),
+            duration: None,
+            exit_code: status.code(),
+            artifacts: vec![context.built_binary_path()],
         })
     }
 }
@@ -857,7 +1058,11 @@ impl RotateStep {
         line
     }
 
-    fn run(self, context: &DeployContext) -> Result<DeployStepReport> {
+    fn run(
+        self,
+        context: &DeployContext,
+        _reporter: &mut dyn Reporter,
+    ) -> Result<DeployStepReport> {
         let description = self.description();
         let outcome = rotate(&RotateOptions {
             source: self.source,
@@ -867,31 +1072,98 @@ impl RotateStep {
             backup_retention: self.backup_retention,
             backup_max_age: self.backup_max_age,
             dry_run: context.dry_run,
+            // The deferred-cleanup policy belongs to the rotation ticket;
+            // `None` keeps the best-effort cleanup `RotateStep` always had.
+            backup_cleanup_retry: None,
         })
         .with_context(|| format!("step 'rotate' failed: {description}"))?;
-        let detail = match &outcome {
-            RotateOutcome::WouldReplace { destination } => {
-                format!("would replace {}", destination.display())
-            }
-            RotateOutcome::Replaced { destination } => {
-                format!("replaced {}", destination.display())
-            }
+        // The rotation prints nothing (0.1.0 behaviour); what it produced is
+        // reported through the artifacts instead.
+        let (detail, artifacts) = match &outcome {
+            RotateOutcome::WouldReplace { destination } => (
+                format!("would replace {}", destination.display()),
+                Vec::new(),
+            ),
+            RotateOutcome::Replaced { destination } => (
+                format!("replaced {}", destination.display()),
+                vec![destination.clone()],
+            ),
             RotateOutcome::ReplacedAfterRename {
                 destination,
                 backup,
-            } => {
+            } => (
                 format!(
                     "replaced {}; previous binary preserved at {}",
                     destination.display(),
                     backup.display()
-                )
-            }
+                ),
+                vec![destination.clone(), backup.clone()],
+            ),
         };
         Ok(DeployStepReport {
             name: "rotate".to_owned(),
             status: StepStatus::Success,
             detail: Some(detail),
+            duration: None,
+            exit_code: None,
+            artifacts,
         })
+    }
+}
+
+/// What a [`RunStep`] ran and what came back: the argument of the predicate
+/// attached with [`RunStep::verify`].
+#[derive(Debug, Clone)]
+pub struct RunOutcome {
+    /// The program that was spawned.
+    pub program: PathBuf,
+    /// The arguments the program was spawned with.
+    pub args: Vec<String>,
+    /// The working directory of the child; `None` means the deploy process's
+    /// own directory.
+    pub current_dir: Option<PathBuf>,
+    /// Whether the child exited zero.
+    pub success: bool,
+    /// The child's exit code; `None` when it was terminated by a signal.
+    pub exit_code: Option<i32>,
+    /// The captured stdout; empty unless [`RunStep::capture_stdout`] is set.
+    pub stdout: String,
+    /// The captured stderr; empty unless [`RunStep::capture_stderr`] is set or
+    /// [`RunStep::allow_failure`] captured it for a failure report.
+    pub stderr: String,
+}
+
+/// The predicate a [`StepVerify`] holds: shared so that a [`RunStep`] stays
+/// `Clone`.
+type VerifyPredicate = Arc<dyn Fn(&RunOutcome) -> Result<()>>;
+
+/// The predicate attached to a [`RunStep`] by [`RunStep::verify`].
+///
+/// It is kept behind an [`Arc`] so that a step stays `Clone`, and is called at
+/// most once per run. Any `Fn` is accepted: the deploy plan runs its steps on
+/// one thread, exactly like the `Custom` steps that take a
+/// `Box<dyn FnMut(&DeployContext) -> Result<()>>`.
+#[derive(Clone)]
+pub struct StepVerify(VerifyPredicate);
+
+impl StepVerify {
+    /// Wrap `verify`.
+    pub fn new<F>(verify: F) -> Self
+    where
+        F: Fn(&RunOutcome) -> Result<()> + 'static,
+    {
+        Self(Arc::new(verify))
+    }
+
+    /// Check `outcome`, returning the predicate's error unchanged.
+    pub fn call(&self, outcome: &RunOutcome) -> Result<()> {
+        (self.0)(outcome)
+    }
+}
+
+impl fmt::Debug for StepVerify {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StepVerify(<predicate>)")
     }
 }
 
@@ -902,6 +1174,19 @@ pub struct RunStep {
     pub current_dir: Option<PathBuf>,
     pub env: Vec<(String, String)>,
     pub allow_failure: bool,
+    /// Capture the child's stdout into [`RunOutcome::stdout`] and the report
+    /// detail.
+    pub capture_stdout: bool,
+    /// Capture the child's stderr into [`RunOutcome::stderr`] and the report
+    /// detail; [`RunStep::allow_failure`] captures it on its own.
+    pub capture_stderr: bool,
+    /// Kill the child and fail the step when it is still running after this
+    /// long.
+    pub timeout: Option<Duration>,
+    /// Require this exit code instead of the "the child succeeded" default.
+    pub expected_status: Option<i32>,
+    /// Predicate checked once the exit status was accepted.
+    pub verify: Option<StepVerify>,
 }
 
 impl RunStep {
@@ -912,6 +1197,11 @@ impl RunStep {
             current_dir: None,
             env: Vec::new(),
             allow_failure: false,
+            capture_stdout: false,
+            capture_stderr: false,
+            timeout: None,
+            expected_status: None,
+            verify: None,
         }
     }
 
@@ -939,6 +1229,52 @@ impl RunStep {
         self
     }
 
+    /// Capture the child's stdout: it reaches [`RunStep::verify`] as
+    /// [`RunOutcome::stdout`] and the step report as a tail of it.
+    pub fn capture_stdout(mut self) -> Self {
+        self.capture_stdout = true;
+        self
+    }
+
+    /// Capture the child's stderr: it reaches [`RunStep::verify`] as
+    /// [`RunOutcome::stderr`] and the step report as a tail of it.
+    pub fn capture_stderr(mut self) -> Self {
+        self.capture_stderr = true;
+        self
+    }
+
+    /// Fail the step when the child is still running after `timeout`, killing
+    /// it first ([`Child::kill`]) so the deploy cannot hang on a command that
+    /// never returns. The error names the program, its arguments, the working
+    /// directory, the timeout, and the exit status after the kill.
+    ///
+    /// A timeout fails the step even with [`RunStep::allow_failure`]: the
+    /// command did not finish, so an exit code would say nothing about it.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Require the child to exit with this status instead of the default "the
+    /// child must succeed". A mismatch fails the step, or - with
+    /// [`RunStep::allow_failure`] - is reported as an ignored failure.
+    pub fn expected_status(mut self, status: i32) -> Self {
+        self.expected_status = Some(status);
+        self
+    }
+
+    /// Check a predicate once the exit status was accepted. It receives the
+    /// [`RunOutcome`], including whatever [`RunStep::capture_stdout`] and
+    /// [`RunStep::capture_stderr`] captured, and fails the step when it returns
+    /// an error.
+    pub fn verify<F>(mut self, verify: F) -> Self
+    where
+        F: Fn(&RunOutcome) -> Result<()> + 'static,
+    {
+        self.verify = Some(StepVerify::new(verify));
+        self
+    }
+
     /// Single-line description of the command this step would run.
     pub fn description(&self) -> String {
         let mut line = format!("run {}", self.program.display());
@@ -952,11 +1288,13 @@ impl RunStep {
         line
     }
 
-    fn run(self, context: &DeployContext) -> Result<DeployStepReport> {
+    fn run(
+        self,
+        _context: &DeployContext,
+        reporter: &mut dyn Reporter,
+    ) -> Result<DeployStepReport> {
         let description = self.description();
-        if !context.quiet {
-            println!("{description}");
-        }
+        reporter.note(&description);
         let mut command = Command::new(&self.program);
         command.args(&self.args);
         if let Some(dir) = &self.current_dir {
@@ -965,7 +1303,12 @@ impl RunStep {
         for (key, value) in &self.env {
             command.env(key, value);
         }
-        if self.allow_failure {
+        // `allow_failure` needs the stderr tail for the report; the capture
+        // switches add the streams the caller asked for.
+        if self.capture_stdout {
+            command.stdout(Stdio::piped());
+        }
+        if self.capture_stderr || self.allow_failure {
             command.stderr(Stdio::piped());
         }
         let mut child = command.spawn().with_context(|| {
@@ -974,39 +1317,157 @@ impl RunStep {
                 self.program.display()
             )
         })?;
-        let stderr = child.stderr.take().map(|mut pipe| {
-            let mut buffer = String::new();
-            let _ = pipe.read_to_string(&mut buffer);
-            buffer
-        });
-        let status = child.wait().with_context(|| {
+        // Drain the pipes while the child runs: a full pipe would block it.
+        let stdout = child.stdout.take().map(read_pipe);
+        let stderr = child.stderr.take().map(read_pipe);
+        let waited = match self.timeout {
+            Some(timeout) => wait_with_timeout(&mut child, timeout),
+            None => child
+                .wait()
+                .map(Waited::Exited)
+                .map_err(anyhow::Error::from),
+        }
+        .with_context(|| {
             format!(
                 "step '{description}' failed: could not wait for `{}`",
                 self.program.display()
             )
         })?;
-        if !status.success() {
-            if !self.allow_failure {
-                anyhow::bail!("step '{description}' failed with {status}");
+        let stdout = join_pipe(stdout);
+        let stderr = join_pipe(stderr);
+        let status = match waited {
+            Waited::Exited(status) => status,
+            Waited::TimedOut(status) => {
+                let timeout = self.timeout.unwrap_or_default();
+                anyhow::bail!(
+                    "step '{description}' timed out after {timeout:?} and the child was killed ({})",
+                    exit_code_text(&status)
+                );
             }
+        };
+        let outcome = RunOutcome {
+            program: self.program.clone(),
+            args: self.args.clone(),
+            current_dir: self.current_dir.clone(),
+            success: status.success(),
+            exit_code: status.code(),
+            stdout,
+            stderr,
+        };
+        let mismatched = match self.expected_status {
+            Some(expected) => status.code() != Some(expected),
+            None => !status.success(),
+        };
+        if mismatched && !self.allow_failure {
+            if let Some(expected) = self.expected_status {
+                anyhow::bail!(
+                    "step '{description}' failed: expected exit code {expected} but got {}",
+                    exit_code_text(&status)
+                );
+            }
+            anyhow::bail!("step '{description}' failed with {status}");
+        }
+        let mut chunks: Vec<String> = Vec::new();
+        if mismatched {
+            // An allowed failure keeps the exit code and the stderr tail.
             let mut detail = format!("exit {status} (allowed failure)");
-            if let Some(tail) = stderr.as_deref().and_then(|text| tail_lines(text, 20))
-                && !tail.is_empty()
-            {
+            if let Some(tail) = captured_tail(&outcome.stderr) {
                 detail.push_str(&format!("; stderr tail:\n{tail}"));
             }
-            return Ok(DeployStepReport {
-                name: format!("run {}", self.program.display()),
-                status: StepStatus::Success,
-                detail: Some(detail),
-            });
+            chunks.push(detail);
+        } else if self.capture_stderr
+            && let Some(tail) = captured_tail(&outcome.stderr)
+        {
+            chunks.push(format!("stderr tail:\n{tail}"));
+        }
+        if self.capture_stdout
+            && let Some(tail) = captured_tail(&outcome.stdout)
+        {
+            chunks.push(format!("stdout tail:\n{tail}"));
+        }
+        if let Some(verify) = &self.verify {
+            verify
+                .call(&outcome)
+                .with_context(|| format!("step '{description}' failed verification"))?;
         }
         Ok(DeployStepReport {
             name: format!("run {}", self.program.display()),
             status: StepStatus::Success,
-            detail: None,
+            detail: (!chunks.is_empty()).then(|| chunks.join("\n")),
+            duration: None,
+            exit_code: outcome.exit_code,
+            artifacts: Vec::new(),
         })
     }
+}
+
+/// How long [`wait_with_timeout`] sleeps between two child-status polls.
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How waiting for a child ended.
+enum Waited {
+    /// The child exited on its own.
+    Exited(ExitStatus),
+    /// The timeout expired: the child was killed and reaped, and this is its
+    /// status after the kill.
+    TimedOut(ExitStatus),
+}
+
+/// Wait for `child` for at most `timeout`, killing it when the timeout
+/// expires: a deploy must not hang on a command that never returns.
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<Waited> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("could not check whether the child process is still running")?
+        {
+            return Ok(Waited::Exited(status));
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            break;
+        }
+        std::thread::sleep(WAIT_POLL_INTERVAL.min(timeout - elapsed));
+    }
+    child
+        .kill()
+        .context("could not kill the child process that timed out")?;
+    let status = child
+        .wait()
+        .context("could not reap the child process that timed out")?;
+    Ok(Waited::TimedOut(status))
+}
+
+/// Read a child pipe to a string in the background, so a full pipe cannot
+/// block the child while the parent waits for it.
+fn read_pipe<R: Read + Send + 'static>(mut pipe: R) -> JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut buffer = String::new();
+        let _ = pipe.read_to_string(&mut buffer);
+        buffer
+    })
+}
+
+/// Join a pipe reader, tolerating a reader thread that did not finish.
+fn join_pipe(handle: Option<JoinHandle<String>>) -> String {
+    match handle {
+        Some(handle) => handle.join().unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
+/// The exit status of a process as it appears in error messages.
+fn exit_code_text(status: &ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => format!("no exit code ({status})"),
+    }
+}
+
+/// The tail of a captured stream, or `None` when it is empty.
+fn captured_tail(text: &str) -> Option<String> {
+    tail_lines(text, 20).filter(|tail| !tail.is_empty())
 }
 
 /// Last `count` lines of `text`, or `None` when the text is empty.
@@ -1051,17 +1512,32 @@ pub struct DeployStepReport {
     pub name: String,
     pub status: StepStatus,
     pub detail: Option<String>,
+    /// How long the step took; `None` for a step that did not run (a skipped
+    /// one), because there is nothing to measure then.
+    pub duration: Option<Duration>,
+    /// The exit code of the process the step ran, when it ran one.
+    pub exit_code: Option<i32>,
+    /// The files the step created or replaced: the installed binary - and the
+    /// backup it was moved aside to - for `rotate`, the built binary for
+    /// `cargo build`, and nothing for a step that did not run.
+    pub artifacts: Vec<PathBuf>,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        time::{Duration, Instant},
+    };
 
     use super::{
-        CargoBuildStep, DeployStep, RunStep, StepStatus, deploy, skip_current_report,
+        CargoBuildStep, DeployStep, DeployStepReport, NullReporter, Reporter, RotateStep, RunStep,
+        StdoutReporter, StepStatus, default_reporter, deploy, skip_current_report,
         verify_installed_binary, write_deploy_stamp,
     };
     use crate::context::{DeployContext, build_inputs_fingerprint};
+    use crate::rotate::RotateStrategy;
 
     fn test_context() -> DeployContext {
         let unique = std::time::SystemTime::now()
@@ -1275,7 +1751,9 @@ mod tests {
         context.package = "no-such-package".to_owned();
 
         let step = CargoBuildStep::from_context(&context);
-        let error = step.run(&context).expect_err("cargo build must fail");
+        let error = step
+            .run(&context, &mut NullReporter)
+            .expect_err("cargo build must fail");
 
         let text = format!("{error:#}");
         assert!(text.contains("step 'cargo build'"), "text: {text}");
@@ -1290,7 +1768,7 @@ mod tests {
 
         let error = RunStep::new("tracel-deploy-missing-program")
             .args(["--flag"])
-            .run(&context)
+            .run(&context, &mut NullReporter)
             .expect_err("spawning a missing program must fail");
 
         let text = format!("{error:#}");
@@ -1759,5 +2237,429 @@ mod tests {
             .expect("plan without the stamp switch");
         assert!(!stamp.exists(), "the stamp must not be written");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- RunStep capabilities, structured reports, and pluggable output ---
+
+    /// A step that writes `boom` to stderr and exits with 3.
+    fn failing_step() -> RunStep {
+        #[cfg(windows)]
+        let step = RunStep::new("cmd").args(["/C", "echo boom 1>&2 & exit 3"]);
+        #[cfg(unix)]
+        let step = RunStep::new("sh").args(["-c", "echo boom 1>&2; exit 3"]);
+        step
+    }
+
+    /// A step that prints `out` on stdout and `err` on stderr and exits 0.
+    fn greeter_step() -> RunStep {
+        #[cfg(windows)]
+        let step = RunStep::new("cmd").args(["/C", "echo out & echo err 1>&2"]);
+        #[cfg(unix)]
+        let step = RunStep::new("sh").args(["-c", "echo out; echo err 1>&2"]);
+        step
+    }
+
+    /// A [`RotateStep`] for the rotate-report tests.
+    fn rotate_step(
+        source: std::path::PathBuf,
+        destination: std::path::PathBuf,
+        backup_dir: Option<std::path::PathBuf>,
+        strategy: RotateStrategy,
+    ) -> RotateStep {
+        RotateStep {
+            source,
+            destination,
+            backup_dir,
+            strategy,
+            backup_retention: None,
+            backup_max_age: None,
+        }
+    }
+
+    #[test]
+    fn run_step_captures_stdout_and_stderr() {
+        let context = test_context();
+        let observed = Rc::new(RefCell::new(None::<(String, String)>));
+        let observed_in_step = Rc::clone(&observed);
+
+        let report = deploy(&context)
+            .without_defaults()
+            .step(DeployStep::Run(
+                greeter_step()
+                    .capture_stdout()
+                    .capture_stderr()
+                    .verify(move |outcome| {
+                        *observed_in_step.borrow_mut() =
+                            Some((outcome.stdout.clone(), outcome.stderr.clone()));
+                        Ok(())
+                    }),
+            ))
+            .run()
+            .expect("captured run");
+
+        let (stdout, stderr) = observed
+            .borrow()
+            .clone()
+            .expect("the predicate saw the outcome");
+        assert!(stdout.contains("out"), "stdout: {stdout:?}");
+        assert!(stderr.contains("err"), "stderr: {stderr:?}");
+        assert_eq!(report.steps[0].exit_code, Some(0));
+        assert!(report.steps[0].duration.is_some());
+        let detail = report.steps[0].detail.clone().unwrap_or_default();
+        assert!(detail.contains("stdout tail"), "detail: {detail}");
+        assert!(detail.contains("stderr tail"), "detail: {detail}");
+    }
+
+    #[test]
+    fn run_step_timeout_kills_the_child() {
+        let dir = temp_workspace("run-timeout");
+        let context = test_context();
+
+        #[cfg(windows)]
+        let step = RunStep::new("cmd").args(["/C", "ping -n 6 127.0.0.1 >nul"]);
+        #[cfg(unix)]
+        let step = RunStep::new("sh").args(["-c", "sleep 5"]);
+
+        let started = Instant::now();
+        let error = step
+            .current_dir(&dir)
+            .timeout(Duration::from_millis(250))
+            .run(&context, &mut NullReporter)
+            .expect_err("the timeout must fail the step");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the child must be killed instead of awaited: {elapsed:?}"
+        );
+        let text = format!("{error:#}");
+        assert!(text.contains("timed out after 250ms"), "text: {text}");
+        assert!(text.contains(&dir.display().to_string()), "cwd: {text}");
+        #[cfg(windows)]
+        {
+            assert!(text.contains("run cmd"), "program: {text}");
+            assert!(text.contains("ping -n 6"), "args: {text}");
+            assert!(text.contains("exit code 1"), "exit code: {text}");
+        }
+        #[cfg(unix)]
+        {
+            assert!(text.contains("run sh"), "program: {text}");
+            assert!(text.contains("sleep 5"), "args: {text}");
+            assert!(text.contains("no exit code"), "exit code: {text}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_step_expected_status_mismatch_is_an_error() {
+        let context = test_context();
+
+        let error = failing_step()
+            .expected_status(0)
+            .run(&context, &mut NullReporter)
+            .expect_err("a mismatching exit code must fail the step");
+
+        let text = format!("{error:#}");
+        assert!(text.contains("expected exit code 0"), "text: {text}");
+        assert!(text.contains("exit code 3"), "text: {text}");
+    }
+
+    #[test]
+    fn run_step_expected_status_accepts_that_code() {
+        let context = test_context();
+
+        let report = failing_step()
+            .expected_status(3)
+            .run(&context, &mut NullReporter)
+            .expect("the expected exit code is not a failure");
+
+        assert_eq!(report.status, StepStatus::Success);
+        assert_eq!(report.exit_code, Some(3));
+    }
+
+    #[test]
+    fn run_step_verify_failure_is_an_error() {
+        let context = test_context();
+
+        let error = greeter_step()
+            .capture_stdout()
+            .verify(|outcome| {
+                anyhow::ensure!(
+                    outcome.stdout.contains("goodbye"),
+                    "the script was expected to greet us, stdout was {:?}",
+                    outcome.stdout
+                );
+                Ok(())
+            })
+            .run(&context, &mut NullReporter)
+            .expect_err("a failing predicate must fail the step");
+
+        let text = format!("{error:#}");
+        assert!(text.contains("failed verification"), "text: {text}");
+        assert!(text.contains("stdout was"), "text: {text}");
+    }
+
+    #[test]
+    fn allowed_failure_reports_exit_code_and_stderr_tail() {
+        let context = test_context();
+
+        let report = deploy(&context)
+            .without_defaults()
+            .step(DeployStep::Run(failing_step().allow_failure(true)))
+            .run()
+            .expect("an allowed failure still succeeds");
+
+        assert_eq!(report.steps[0].status, StepStatus::Success);
+        assert_eq!(report.steps[0].exit_code, Some(3));
+        assert!(report.steps[0].duration.is_some());
+        let detail = report.steps[0].detail.clone().unwrap_or_default();
+        assert!(detail.contains("allowed failure"), "detail: {detail}");
+        assert!(detail.contains("stderr tail"), "detail: {detail}");
+        assert!(detail.contains("boom"), "detail: {detail}");
+    }
+
+    #[test]
+    fn rotate_reports_artifacts_and_duration() {
+        let dir = temp_workspace("rotate-report");
+        let source = dir.join("source");
+        let destination = dir.join("installed");
+        std::fs::write(&source, "new bytes").expect("source");
+        let mut context = test_context();
+        context.source_binary = Some(source.clone());
+        context.install_path = destination.clone();
+
+        let report = deploy(&context)
+            .without_defaults()
+            .step(DeployStep::Rotate(rotate_step(
+                source,
+                destination.clone(),
+                None,
+                RotateStrategy::Auto,
+            )))
+            .run()
+            .expect("rotate step");
+
+        assert_eq!(report.steps[0].status, StepStatus::Success);
+        assert!(
+            report.steps[0].duration.is_some(),
+            "a step that ran reports how long it took"
+        );
+        assert!(report.steps[0].exit_code.is_none());
+        assert!(
+            report.steps[0].artifacts.contains(&destination),
+            "artifacts: {:?}",
+            report.steps[0].artifacts
+        );
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("installed"),
+            "new bytes"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rotate_reports_the_backup_it_replaced() {
+        let dir = temp_workspace("rotate-backup");
+        let source = dir.join("source");
+        let destination = dir.join("installed");
+        std::fs::write(&source, "new bytes").expect("source");
+        std::fs::write(&destination, "old bytes").expect("destination");
+        let mut context = test_context();
+        context.source_binary = Some(source.clone());
+        context.install_path = destination.clone();
+
+        let report = deploy(&context)
+            .without_defaults()
+            .step(DeployStep::Rotate(rotate_step(
+                source,
+                destination.clone(),
+                None,
+                RotateStrategy::RenameAside,
+            )))
+            .run()
+            .expect("rename-aside rotation");
+
+        let artifacts = &report.steps[0].artifacts;
+        assert_eq!(
+            artifacts.first(),
+            Some(&destination),
+            "artifacts: {artifacts:?}"
+        );
+        let backup = artifacts.get(1).cloned().expect("the backup artifact");
+        assert_ne!(backup, destination);
+        assert!(backup.is_file(), "backup {backup:?} must exist");
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("backup"),
+            "old bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("installed"),
+            "new bytes"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Reporter that records every event it receives, in order.
+    #[derive(Default)]
+    struct RecordingReporter {
+        events: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl RecordingReporter {
+        fn new(events: &Rc<RefCell<Vec<String>>>) -> Self {
+            Self {
+                events: Rc::clone(events),
+            }
+        }
+
+        fn record(&self, event: String) {
+            self.events.borrow_mut().push(event);
+        }
+    }
+
+    impl Reporter for RecordingReporter {
+        fn plan(&mut self, lines: &[String]) {
+            for line in lines {
+                self.record(format!("plan: {line}"));
+            }
+        }
+
+        fn step_started(&mut self, name: &str, description: &str) {
+            self.record(format!("started: {name}: {description}"));
+        }
+
+        fn note(&mut self, message: &str) {
+            self.record(format!("note: {message}"));
+        }
+
+        fn step_finished(&mut self, report: &DeployStepReport) {
+            self.record(format!(
+                "finished: {} {:?} duration={:?}",
+                report.name, report.status, report.duration
+            ));
+        }
+
+        fn warning(&mut self, message: &str) {
+            self.record(format!("warning: {message}"));
+        }
+    }
+
+    #[test]
+    fn dry_run_plan_goes_through_the_reporter() {
+        let mut context = test_context();
+        context.dry_run = true;
+        let events = Rc::new(RefCell::new(Vec::new()));
+
+        let report = deploy(&context)
+            .reporter(RecordingReporter::new(&events))
+            .run()
+            .expect("dry-run plan");
+
+        assert!(!report.plan.is_empty(), "plan: {:?}", report.plan);
+        let recorded: Vec<String> = events.borrow().clone();
+        assert_eq!(recorded.len(), report.plan.len(), "recorded: {recorded:?}");
+        for (event, line) in recorded.iter().zip(&report.plan) {
+            assert_eq!(event, &format!("plan: {line}"));
+        }
+    }
+
+    #[test]
+    fn executed_steps_go_through_the_reporter() {
+        // The default test context is quiet; an injected reporter runs anyway.
+        let context = test_context();
+        assert!(context.quiet);
+        let events = Rc::new(RefCell::new(Vec::new()));
+
+        let report = deploy(&context)
+            .without_defaults()
+            .reporter(RecordingReporter::new(&events))
+            .step(DeployStep::Run(greeter_step()))
+            .run()
+            .expect("run step");
+
+        assert_eq!(report.steps.len(), 1);
+        let recorded: Vec<String> = events.borrow().clone();
+        for prefix in ["started: run ", "note: run ", "finished: run "] {
+            assert!(
+                recorded.iter().any(|event| event.starts_with(prefix)),
+                "missing {prefix} in {recorded:?}"
+            );
+        }
+        assert!(
+            recorded
+                .iter()
+                .any(|event| event.contains("duration=Some(")),
+            "the finished event carries the duration: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn default_reporter_follows_context_quiet() {
+        let mut context = test_context();
+        assert!(context.quiet);
+        assert!(default_reporter(&context).is_quiet());
+
+        context.quiet = false;
+        assert!(!default_reporter(&context).is_quiet());
+        assert!(StdoutReporter::quiet().is_quiet());
+        assert!(!StdoutReporter::new().is_quiet());
+    }
+
+    /// Run the stdout probe in a child copy of this test binary, which is the
+    /// only way to look at what the default reporter really printed.
+    fn stdout_probe(case: &str) -> String {
+        let executable = std::env::current_exe().expect("the test binary");
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "plan::tests::stdout_reporter_keeps_the_printed_lines",
+                "--nocapture",
+            ])
+            .env("TRACEL_DEPLOY_PROBE_CASE", case)
+            .output()
+            .expect("run the stdout probe");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            stdout.contains("PROBE-DONE"),
+            "the probe did not run for {case}: stdout {stdout:?}, stderr {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    }
+
+    #[test]
+    fn stdout_reporter_keeps_the_printed_lines() {
+        if let Some(case) = std::env::var_os("TRACEL_DEPLOY_PROBE_CASE") {
+            let case = case.to_string_lossy().into_owned();
+            let mut context = test_context();
+            context.dry_run = true;
+            context.quiet = case == "quiet";
+            match case.as_str() {
+                "injected" => {
+                    deploy(&context)
+                        .reporter(NullReporter)
+                        .run()
+                        .expect("dry-run plan");
+                }
+                _ => {
+                    deploy(&context).run().expect("dry-run plan");
+                }
+            }
+            println!("PROBE-DONE");
+            return;
+        }
+
+        let verbose = stdout_probe("verbose");
+        assert!(
+            verbose.contains("would: ") && verbose.contains("build -p tracel-deploy-test"),
+            "verbose: {verbose:?}"
+        );
+        assert!(verbose.contains("would: rotate "), "verbose: {verbose:?}");
+
+        let quiet = stdout_probe("quiet");
+        assert!(!quiet.contains("would:"), "quiet: {quiet:?}");
+
+        let injected = stdout_probe("injected");
+        assert!(!injected.contains("would:"), "injected: {injected:?}");
     }
 }

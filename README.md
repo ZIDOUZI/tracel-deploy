@@ -164,6 +164,17 @@ directory instead of the install directory. `RotateOptions::backup_retention`
 by a running process are left in place, and `--backup-retention` /
 `--backup-max-age-days` expose the same settings on the command line.
 
+**Deferred cleanup.** `RotateOptions::backup_cleanup_retry` (`BackupRetry`,
+default 7 days / 32 entries) turns on deferred cleanup: when a `<binary>.old-*`
+backup cannot be removed - the usual Windows case is a file still held by a
+running process - the rotation does not fail. The path, first failure, attempt
+count, and reason are registered in `<backup_dir>/<binary>.pending-delete`, the
+next rotation retries them first, and `cleanup_pending_backups(&options)` offers
+the same retry explicitly. Entries beyond `max_age` / `max_entries` are dropped
+and reported in `CleanupReport::discarded` (`expired` / `evicted` /
+`out-of-scope`). Dry runs neither delete nor register, and only backups of the
+current destination are ever touched.
+
 ## Service Helpers (feature `service`)
 
 The `service` feature (off by default) adds the helpers a `stop -> rotate ->
@@ -265,3 +276,26 @@ available as `DeployReport::plan`:
 would: cargo build -p my-service --color always --release
 would: rotate D:\work\my-service\target\release\my-service.exe -> C:\Users\me\.cargo\bin\my-service.exe
 ```
+
+Every printed line goes through a `Reporter`. The default `StdoutReporter` keeps
+the 0.1.0 output and stays silent when the context sets `quiet`,
+`NullReporter` silences everything, and `DeployBuilder::reporter(...)` lets a
+caller collect structured events instead (`plan`, `step_started`, `note`,
+`step_finished`, `warning`).
+
+`DeployStepReport` carries `status`, `duration`, `exit_code`, `artifacts`, and
+`detail`. `RunStep` adds `capture_stdout()` / `capture_stderr()`,
+`timeout(Duration)` (the child is killed and the error names program, args, cwd,
+the timeout, and the exit code), `expected_status(i32)`, and
+`verify(|outcome| ...)`; `allow_failure(true)` still succeeds and keeps the exit
+code plus the stderr tail.
+
+## State Files and Paths
+
+`state::write_state_file` (atomic `<name>.tmp` + rename), `read_state_file`
+(missing file reads as `None`), and `remove_state_file` give consumers the same
+state convention the deploy stamp and the service module use.
+`same_file_path` compares two paths the way Windows does (strips the `\\?\`
+prefix, normalizes separators, ignores case) and case-sensitively elsewhere, and
+`resolve_install_path` turns either an install directory or a full file path
+into the final binary path.
