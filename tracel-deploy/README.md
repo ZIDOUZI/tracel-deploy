@@ -294,16 +294,17 @@ run in it:
 
 1. the hook calls `xtask deploy --background`;
 2. `DeployQueueArgs` carries the two switches (`--background`, and the hidden
-   `--child` the queued process gets), and `queue_deploy` re-spawns the same
-   executable detached with `--background` swapped for `--child`, stdout and
-   stderr redirected to `<state_dir>/deploy.log` and
+   `--child` the queued process gets), `child_argv` swaps the one for the other,
+   and `queue_deploy` re-spawns the same executable detached with that command
+   line, stdout and stderr redirected to `<state_dir>/deploy.log` and
    `<state_dir>/deploy-error.log`, and returns the child pid at once;
 3. the child runs the ordinary plan, so the stamp skips an unchanged checkout,
    the lock keeps two deployments of one binary apart, and a real change is
    built, rotated, verified, and stamped.
 
 A consumer's `deploy` command therefore needs four lines rather than its own
-argv rewriting, log handling, and detached spawn:
+argv rewriting, log handling, and detached spawn. `queue_deploy` uses the `argv`
+it is given verbatim, so the `child_argv` call is not optional:
 
 ```rust
 #[derive(clap::Args, Clone, Debug)]
@@ -321,7 +322,7 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         let pid = tracel_deploy::queue_deploy(
             &context.state_dir,
             Some(root),
-            env::args_os().skip(1),
+            tracel_deploy::child_argv(env::args_os().skip(1)),
         )?;
         println!("queued my-app redeploy (pid={pid})");
         return Ok(());

@@ -5,16 +5,17 @@
 //! builds. The pattern this module implements:
 //!
 //! 1. The hook calls `xtask deploy --background`.
-//! 2. That process does not deploy: [`queue_deploy`] re-spawns the same
-//!    executable detached, with `--background` swapped for `--child`, redirects
-//!    stdout to `<state_dir>/deploy.log` and stderr to
-//!    `<state_dir>/deploy-error.log`, and returns at once with the child's pid.
+//! 2. That process does not deploy: [`child_argv`] swaps `--background` for
+//!    `--child`, and [`queue_deploy`] re-spawns the same executable - detached,
+//!    with that argv - redirecting stdout to `<state_dir>/deploy.log` and stderr
+//!    to `<state_dir>/deploy-error.log`, and returns the child's pid at once.
 //! 3. The child runs the ordinary plan, so the deployment stamp skips it when
 //!    nothing changed, the lock keeps two deployments of one binary apart, and a
 //!    real change is built, rotated, verified, and stamped.
 //!
-//! [`DeployQueueArgs`] carries the two switches, so a consumer's `deploy`
-//! command needs no argv rewriting, log handling or detached spawn of its own:
+//! [`DeployQueueArgs`] carries the two switches and [`child_argv`] builds the
+//! child's command line, so a consumer's `deploy` command needs no argv
+//! rewriting, log handling or detached spawn of its own:
 //!
 //! ```ignore
 //! #[derive(clap::Args, Clone, Debug)]
@@ -32,7 +33,7 @@
 //!         let pid = tracel_deploy::queue_deploy(
 //!             &context.state_dir,
 //!             Some(root),
-//!             env::args_os().skip(1),
+//!             tracel_deploy::child_argv(env::args_os().skip(1)),
 //!         )?;
 //!         println!("queued my-app redeploy (pid={pid})");
 //!         return Ok(());
@@ -143,6 +144,10 @@ pub fn child_argv(argv: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
 /// Queues `argv` as a detached child of the current executable and returns its
 /// pid.
 ///
+/// `argv` is passed through verbatim: the `--background` -> `--child` swap is
+/// [`child_argv`]'s job. Queueing the caller's own arguments without it makes
+/// the child see `--background` again and queue one more child forever.
+///
 /// `working_dir` is the directory the child runs in (a Cargo workspace root, so
 /// the child finds the same workspace the hook was invoked from); `None` keeps
 /// the caller's working directory.
@@ -156,7 +161,8 @@ pub fn queue_deploy(
 }
 
 /// [`queue_deploy`] with an explicit executable, for callers that queue
-/// something other than themselves (and for tests).
+/// something other than themselves (and for tests). `argv` is passed through
+/// verbatim, exactly like [`queue_deploy`].
 pub fn queue_executable(
     executable: &Path,
     state_dir: &Path,
@@ -351,6 +357,10 @@ mod tests {
             swapped,
             ["deploy", "--child", "--force"].map(OsString::from),
             "the child runs the same deployment, minus the queueing switch"
+        );
+        assert!(
+            !swapped.contains(&OsString::from("--background")),
+            "a child that keeps --background queues another child forever"
         );
         assert_eq!(
             child_argv(["deploy", "--install-to", r"C:\tmp\app.exe"].map(OsString::from)),

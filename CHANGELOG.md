@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Documentation
+
+- The `background` module example built the queued child's command line without
+  `child_argv`, so a copied example queued a child that queues another child:
+  `queue_deploy` passes its `argv` through verbatim and never swaps
+  `--background` for `--child` itself. The example and the module overview now
+  call `child_argv`, and both queue functions document the pass-through.
+
 ## 0.2.1
 
 Hook-driven background deploys plus a dependency floor. The 0.2 API is
