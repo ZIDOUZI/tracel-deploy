@@ -3,7 +3,7 @@ resolver = "2"
 members = ["tracel-deploy", "tracel-deploy-macros"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
@@ -15,4 +15,10 @@ clap = { version = "4", features = ["derive"] }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }
-tracel-xtask = "3.0"
+# Floor only and deliberately far below anything this crate tests: no upper
+# bound means cargo resolves the `tracel-xtask` a consumer already uses (3.x,
+# 4.x, 5.x, ...) instead of dragging a second copy of the framework into their
+# xtask graph. `tracel-deploy` itself only borrows `Context`, `Environment` and
+# `XtaskArgs` for the `prelude` re-exports and the generated handler signature,
+# all of which exist on every published line.
+tracel-xtask = ">=0.3"

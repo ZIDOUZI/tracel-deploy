@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.1
+
+Hook-driven background deploys plus a dependency floor. The 0.2 API is
+unchanged, so consumers only have to bump the version.
+
+### Hook-driven deploys
+
+- `DeployQueueArgs` (`--background`, hidden `--child`) plus `queue_deploy` /
+  `queue_executable`: the per-turn hook shape, so a hook returns at once and a
+  detached child runs the deployment with its output in
+  `<state_dir>/deploy.log` and `<state_dir>/deploy-error.log` (both truncated
+  per queued run). No consumer has to rewrite argv, open logs, or build its own
+  detached spawn again.
+- `codex_stop_hook_command` and `codex_stop_hook_json` render the
+  `.codex/hooks.json` `Stop` entry (`async: true`, hook timeout, status message)
+  that calls `deploy --background`.
+- The Windows detached spawn (breakaway, `ERROR_ACCESS_DENIED` retry) now lives
+  in one place and is shared with the `service` feature.
+
+### Dependencies
+
+- `tracel-xtask` is a floor only (`>=0.3`, no upper bound): cargo resolves the
+  version a consumer already uses (3.x, 4.x, 5.x, ...) instead of adding a
+  second copy of the framework to their xtask graph. Verified both ways: the
+  locked 3.2.0 still builds this workspace, and a consumer resolving 5.3.0
+  compiles `tracel-deploy` against it.
+
 ## 0.2.0
 
 The 0.2.0 line is the hardening release: hooks with a real failure model,

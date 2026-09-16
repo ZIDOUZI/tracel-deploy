@@ -17,11 +17,13 @@ service = []
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-tracel-deploy-macros = { version = "0.2.0", path = "../tracel-deploy-macros" }
+tracel-deploy-macros = { version = "0.2.1", path = "../tracel-deploy-macros" }
 tracel-xtask.workspace = true
 
 [dev-dependencies]
 # Aliased for the crate-level `compile_fail` doctest, which shows the real
 # `base_commands` ordering errors. (An xtask crate usually aliases this as
 # `macros`, which is also what `tracel_xtask::prelude` re-exports.)
-xtask-macros = { package = "tracel-xtask-macros", version = "3.0" }
+# Floor only, like the `tracel-xtask` dependency above: the consumer's version
+# wins, and the lock keeps this crate on the line it was tested with.
+xtask-macros = { package = "tracel-xtask-macros", version = ">=0.3" }

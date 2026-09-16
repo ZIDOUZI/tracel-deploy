@@ -1044,16 +1044,13 @@ mod sys {
     use std::{
         ffi::c_void,
         io,
-        os::windows::{ffi::OsStringExt as _, process::CommandExt as _},
+        os::windows::ffi::OsStringExt as _,
         path::{Path, PathBuf},
         process::{Child, Command},
     };
 
     use anyhow::{Result, bail};
 
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
     const PROCESS_TERMINATE: u32 = 0x0001;
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const SYNCHRONIZE: u32 = 0x0010_0000;
@@ -1207,16 +1204,7 @@ mod sys {
     /// job that forbids it answers `ERROR_ACCESS_DENIED`; the retry then keeps
     /// the plain detachment.
     pub fn spawn_detached(command: &mut Command) -> io::Result<Child> {
-        command.creation_flags(
-            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
-        );
-        match command.spawn() {
-            Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
-                command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-                command.spawn()
-            }
-            result => result,
-        }
+        crate::detach::spawn_detached(command)
     }
 
     /// Candidate pids for `image`, filtered by image name; the caller verifies

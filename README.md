@@ -5,7 +5,8 @@ Composable deployment helpers for [`tracel-xtask`](https://github.com/tracel-ai/
 The workspace contains:
 
 - `tracel-deploy`: runtime library with a `deploy` builder, pre/post hooks,
-  generic build/run/rotate steps, and a cross-platform `rotate` function.
+  generic build/run/rotate steps, a cross-platform `rotate` function, and a
+  detached deploy queue (`--background`) for per-turn hook-driven redeploys.
 - `tracel-deploy-macros`: `#[deploy_commands(...)]`, which mirrors
   `tracel_xtask_macros::base_commands` by adding a `Deploy` subcommand to an
   xtask command enum.

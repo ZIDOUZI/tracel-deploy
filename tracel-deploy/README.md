@@ -43,6 +43,25 @@ remaining `base_commands` attribute.
 arguments. Without `handler`, the macro only adds the variant; dispatch it
 yourself.
 
+### tracel-xtask versions
+
+The dependency is a floor with no upper bound (`tracel-xtask = ">=0.3"`), so
+cargo resolves the `tracel-xtask` an xtask crate already depends on - 3.x, 4.x
+or 5.x - instead of adding a second copy of the framework to its graph. Only
+three prelude items are borrowed (`Context`, `Environment`, `XtaskArgs`), all of
+which exist on every published line. `main.rs` differs between lines, so write
+it for the version you depend on:
+
+```rust
+// tracel-xtask 3.x
+let args = init_xtask::<Command>(parse_args::<Command>()?)?;
+handle_deploy_command(command, args.environment, args.context);
+
+// tracel-xtask 4.x / 5.x: `parse_args` returns `(XtaskArgs<C>, Environment)`
+let (args, environment) = init_xtask::<Command>(parse_args::<Command>()?)?;
+handle_deploy_command(command, environment, args.context);
+```
+
 ## Deploy Function
 
 ```rust
@@ -265,3 +284,86 @@ available as `DeployReport::plan`:
 would: cargo build -p my-service --color always --release
 would: rotate D:\work\my-service\target\release\my-service.exe -> C:\Users\me\.cargo\bin\my-service.exe
 ```
+
+## Deploy After Every Turn (Codex `Stop` hook)
+
+An editor or agent can redeploy a checkout after every turn: Codex runs a
+repository's `Stop` hook once a turn is finished. The hook has a timeout and
+must not sit through a cargo build, so the deployment is *queued* rather than
+run in it:
+
+1. the hook calls `xtask deploy --background`;
+2. `DeployQueueArgs` carries the two switches (`--background`, and the hidden
+   `--child` the queued process gets), and `queue_deploy` re-spawns the same
+   executable detached with `--background` swapped for `--child`, stdout and
+   stderr redirected to `<state_dir>/deploy.log` and
+   `<state_dir>/deploy-error.log`, and returns the child pid at once;
+3. the child runs the ordinary plan, so the stamp skips an unchanged checkout,
+   the lock keeps two deployments of one binary apart, and a real change is
+   built, rotated, verified, and stamped.
+
+A consumer's `deploy` command therefore needs four lines rather than its own
+argv rewriting, log handling, and detached spawn:
+
+```rust
+#[derive(clap::Args, Clone, Debug)]
+pub struct DeployArgs {
+    #[command(flatten)]
+    pub queue: tracel_deploy::DeployQueueArgs,
+    #[command(flatten)]
+    pub common: tracel_deploy::DeployCmdArgs,
+}
+
+fn deploy(args: DeployArgs) -> anyhow::Result<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask");
+    let context = tracel_deploy::DeployContext::from_args(&args.common, root, "my-app")?;
+    if args.queue.should_queue(args.common.dry_run) {
+        let pid = tracel_deploy::queue_deploy(
+            &context.state_dir,
+            Some(root),
+            env::args_os().skip(1),
+        )?;
+        println!("queued my-app redeploy (pid={pid})");
+        return Ok(());
+    }
+    tracel_deploy::deploy(&context).run()?;
+    Ok(())
+}
+```
+
+`codex_stop_hook_command(xtask_manifest)` renders that command line and
+`codex_stop_hook_json(command, status_message, timeout_secs)` the
+`.codex/hooks.json` entry to merge (or to use as the whole file):
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo run --quiet --manifest-path D:\\work\\my-app\\xtask\\Cargo.toml -- deploy --background",
+            "statusMessage": "my-app: queueing local redeploy",
+            "timeout": 30,
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Three properties of that entry are deliberate:
+
+- `async: true` keeps the turn from waiting for the queue call; without it the
+  hook blocks the turn until the command returns.
+- `timeout` is the *hook's* budget, not the deployment's - only the queue call
+  runs inside it, the build happens in the detached child.
+- `Stop` fires per turn; `SessionEnd` only runs when a session actually ends.
+
+Any edit to `.codex/hooks.json` invalidates the recorded hook trust hash, so an
+edited hook has to be re-approved (Codex `/hooks`) or it is skipped silently. A
+dry run is never queued: `should_queue` is false while `--dry-run` is set, so
+the plan is rendered by the calling process and stays where it can be read.
