@@ -12,7 +12,8 @@ use anyhow::{Context as _, Result};
 
 use crate::{
     context::{
-        DeployContext, DeployLock, FileFingerprint, build_inputs_fingerprint, file_fingerprint,
+        DeployContext, DeployLock, FileFingerprint, STALE_LOCK_AFTER, build_inputs_fingerprint,
+        content_matches, file_fingerprint,
     },
     rotate::{RotateOptions, RotateOutcome, RotateStrategy, rotate},
 };
@@ -643,13 +644,16 @@ impl<'a> DeployBuilder<'a> {
         self
     }
 
-    /// Enable or disable the idempotent short-circuit.
+    /// Enable or disable the *before-the-build* short-circuit.
     ///
-    /// The default follows the plan: on for the default build + rotate plan,
-    /// off after [`without_defaults`](Self::without_defaults) — exactly the
-    /// behaviour of earlier releases. Call it explicitly to opt a caller-owned
-    /// plan into the short-circuit (or to force the default plan to always
-    /// run):
+    /// It is off by default, for every plan: the default answers "is anything
+    /// stale?" by letting **cargo** decide (the build step runs, and cargo
+    /// no-ops when its own fingerprints say the output is current) and by
+    /// comparing the built binary with the installed one (which makes the
+    /// rotation a no-op instead of a rewrite). Turning the switch on restores
+    /// the cheaper pre-build comparison, at the price of maintaining the
+    /// build-input list and of missing everything cargo tracks but that list
+    /// does not (features, profile, `RUSTFLAGS`, `include_bytes!` files, ...):
     ///
     /// ```ignore
     /// deploy(&context)
@@ -664,6 +668,9 @@ impl<'a> DeployBuilder<'a> {
     /// still matches the recorded fingerprint. A changed source tree is never
     /// skipped just because the previously built binary happens to equal the
     /// installed one, and a missing or legacy stamp never skips.
+    ///
+    /// The stamp itself keeps being written after a successful rotation; with
+    /// the switch off it is diagnostics, not the decision.
     pub fn idempotent_skip(mut self, enabled: bool) -> Self {
         self.idempotent_skip = Some(enabled);
         self
@@ -674,7 +681,8 @@ impl<'a> DeployBuilder<'a> {
     /// The default follows the plan (on for the default plan, off after
     /// [`without_defaults`](Self::without_defaults)). Verification compares the
     /// built binary with the installed one and fails the deploy on a mismatch;
-    /// it is not part of the skip path.
+    /// it is not part of the skip path, and a rotation that found nothing to
+    /// install (its step reports [`StepStatus::Skipped`]) skips it too.
     pub fn verify_install(mut self, enabled: bool) -> Self {
         self.verify_install = Some(enabled);
         self
@@ -686,13 +694,15 @@ impl<'a> DeployBuilder<'a> {
     /// [`without_defaults`](Self::without_defaults)). The stamp records the
     /// source, destination, and build-input fingerprints plus the install time
     /// in `state_dir`; a failure to write it only warns, because the deploy
-    /// itself succeeded.
+    /// itself succeeded. A rotation that found nothing to install writes no new
+    /// stamp, so the file keeps describing the last real install.
     pub fn write_deploy_stamp(mut self, enabled: bool) -> Self {
         self.write_deploy_stamp = Some(enabled);
         self
     }
 
     pub fn run(mut self) -> Result<DeployReport> {
+        let mut rotate_index = None;
         if self.defaults {
             let mut steps = DeployPlan::standard(self.context);
             let rotate = steps
@@ -700,18 +710,19 @@ impl<'a> DeployBuilder<'a> {
                 .expect("the standard plan always contains a rotation step");
             steps.append(&mut self.insert_after_build);
             steps.append(&mut self.insert_before_rotate);
+            rotate_index = Some(steps.len());
             steps.push(rotate);
             steps.append(&mut self.plan.steps);
             self.plan.steps = steps;
         }
-        let skip_when_unchanged = self.idempotent_skip.unwrap_or(self.defaults);
+        let skip_when_unchanged = self.idempotent_skip.unwrap_or(false);
         let verify_after_rotate = self.verify_install.unwrap_or(self.defaults);
         let stamp_after_rotate = self.write_deploy_stamp.unwrap_or(self.defaults);
         let context = self.context;
         let mut reporter: Box<dyn Reporter> = self
             .reporter
             .unwrap_or_else(|| Box::new(default_reporter(context)));
-        let _lock = if context.dry_run {
+        let lock = if context.dry_run {
             None
         } else {
             Some(DeployLock::acquire(
@@ -719,6 +730,12 @@ impl<'a> DeployBuilder<'a> {
                 &context.binary_name,
             )?)
         };
+        if let Some(pid) = lock.as_ref().and_then(DeployLock::took_over) {
+            reporter.note(&format!(
+                "cleaned up a stale deployment lock left by pid {pid} (older than {} minutes)",
+                STALE_LOCK_AFTER.as_secs() / 60
+            ));
+        }
         if skip_when_unchanged
             && !context.dry_run
             && let Some(report) = skip_current_report(context)?
@@ -730,11 +747,20 @@ impl<'a> DeployBuilder<'a> {
             return Ok(report);
         }
         let report = self.plan.run_with(context, reporter.as_mut())?;
-        if !context.dry_run && verify_after_rotate {
+        // A rotation that found the installed binary already current installed
+        // nothing: there is nothing to verify and nothing new to stamp.
+        let rotation_skipped = rotate_index.is_some_and(|index| {
+            report
+                .steps
+                .get(index)
+                .is_some_and(|step| step.status == StepStatus::Skipped)
+        });
+        if !context.dry_run && verify_after_rotate && !rotation_skipped {
             verify_installed_binary(context)?;
         }
         if !context.dry_run
             && stamp_after_rotate
+            && !rotation_skipped
             && let Err(error) = write_deploy_stamp(context)
         {
             reporter.warning(&format!(
@@ -1197,6 +1223,29 @@ impl RotateStep {
         _reporter: &mut dyn Reporter,
     ) -> Result<DeployStepReport> {
         let description = self.description();
+        // Cargo already answered "is the build output stale?"; this answers the
+        // second question - "is the installed binary that output?". Identical
+        // bytes mean the install is current: nothing is copied, no backup is
+        // created, and a running binary is left alone (on Windows the Windows
+        // rotation would otherwise rename it aside on every run).
+        if !context.dry_run
+            && !context.force
+            && self.source.is_file()
+            && self.destination.is_file()
+            && content_matches(&self.source, &self.destination).unwrap_or(false)
+        {
+            return Ok(DeployStepReport {
+                name: "rotate".to_owned(),
+                status: StepStatus::Skipped,
+                detail: Some(format!(
+                    "{} is already the built binary",
+                    self.destination.display()
+                )),
+                duration: None,
+                exit_code: None,
+                artifacts: Vec::new(),
+            });
+        }
         let outcome = rotate(&RotateOptions {
             source: self.source,
             destination: self.destination,
@@ -1674,15 +1723,23 @@ mod tests {
     use crate::context::{DeployContext, build_inputs_fingerprint};
     use crate::rotate::RotateStrategy;
 
+    /// Makes every [`test_context`] state directory unique even for two tests
+    /// that ask for one within the same clock tick.
+    static TEST_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn test_context() -> DeployContext {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
+        // Parallel tests can ask for a context in the same instant, so the
+        // clock alone is not unique enough for the state directory: the lock
+        // file of one test then blocks another (`deployment already running`).
+        let sequence = TEST_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut context = DeployContext::new(std::env::temp_dir(), "tracel-deploy-test");
         context.quiet = true;
         context.state_dir = std::env::temp_dir().join(format!(
-            "tracel-deploy-state-{}-{unique}",
+            "tracel-deploy-state-{}-{unique}-{sequence}",
             std::process::id()
         ));
         context
@@ -2116,7 +2173,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_artifacts_skip_the_default_plan() {
+    fn the_pre_build_skip_is_opt_in() {
         let dir = std::env::temp_dir().join(format!(
             "tracel-deploy-skip-{}-{}",
             std::process::id(),
@@ -2139,7 +2196,10 @@ mod tests {
             .build();
         write_deploy_stamp(&context).expect("stamp");
 
-        let report = deploy(&context).run().expect("skipped deploy");
+        let report = deploy(&context)
+            .idempotent_skip(true)
+            .run()
+            .expect("skipped deploy");
 
         assert_eq!(report.steps.len(), 2);
         assert_eq!(report.steps[0].status, StepStatus::Skipped);
@@ -2147,6 +2207,136 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&destination).expect("destination"),
             "same bytes"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_default_plan_lets_cargo_decide() {
+        let (dir, context) = stamped_workspace("cargo-decides");
+
+        // The stamp is current, but the default plan does not trust it any
+        // more: the build step runs and cargo's own fingerprints decide. This
+        // fake workspace has no such package, so that decision surfaces as the
+        // build error instead of a silent skip.
+        let error = deploy(&context)
+            .run()
+            .expect_err("the default plan must run the build step");
+        let text = format!("{error:#}");
+        assert!(text.contains("cargo build"), "text: {text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_install_that_is_already_the_built_binary_is_not_rotated() {
+        let dir = temp_workspace("rotate-noop");
+        let source = dir.join("built");
+        let destination = dir.join("installed");
+        std::fs::write(&source, "same bytes").expect("source");
+        std::fs::write(&destination, "same bytes").expect("destination");
+        let context = DeployContext::builder(&dir, "tracel-deploy-test")
+            .quiet(true)
+            .source(&source)
+            .install_to(&destination)
+            .build();
+
+        let report = rotate_step(
+            source.clone(),
+            destination.clone(),
+            None,
+            RotateStrategy::Auto,
+        )
+        .run(&context, &mut NullReporter)
+        .expect("rotation");
+        assert_eq!(report.status, StepStatus::Skipped);
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("installed"),
+            "same bytes"
+        );
+        assert_eq!(
+            backup_count(&dir, "installed"),
+            0,
+            "a no-op rotation must not leave a backup behind"
+        );
+
+        // `--force` deploys anyway, so the rotation runs for real.
+        let mut forced = context;
+        forced.force = true;
+        let report = rotate_step(
+            source.clone(),
+            destination.clone(),
+            None,
+            RotateStrategy::Auto,
+        )
+        .run(&forced, &mut NullReporter)
+        .expect("forced rotation");
+        assert_eq!(report.status, StepStatus::Success);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_default_plan_builds_with_cargo_and_rotates_only_a_real_change() {
+        let dir = temp_workspace("cargo-mode");
+        std::fs::create_dir_all(dir.join("src")).expect("src dir");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"tracel-deploy-cargo-mode\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(
+            dir.join("src/main.rs"),
+            "fn main() { println!(\"one\"); }\n",
+        )
+        .expect("main");
+        let installed = dir.join("installed.exe");
+        let context = DeployContext::builder(&dir, "tracel-deploy-cargo-mode")
+            .quiet(true)
+            .install_to(&installed)
+            .state_dir(dir.join("state"))
+            .build();
+        let stamp = context
+            .state_dir
+            .join(format!("{}.stamp", context.binary_name));
+
+        // 1. first run: cargo builds, the rotation installs, the stamp lands.
+        let first = deploy(&context).run().expect("first deploy");
+        assert_eq!(first.steps[0].status, StepStatus::Success, "cargo builds");
+        assert_eq!(first.steps[1].status, StepStatus::Success, "rotated");
+        assert!(installed.is_file(), "the binary is installed");
+        let stamped = std::fs::read_to_string(&stamp).expect("stamp");
+
+        // 2. nothing changed: cargo no-ops on its own fingerprints, and the
+        //    rotation sees the installed binary is already the built one.
+        let second = deploy(&context).run().expect("second deploy");
+        assert_eq!(
+            second.steps[0].status,
+            StepStatus::Success,
+            "the build step always runs; cargo decides"
+        );
+        assert_eq!(
+            second.steps[1].status,
+            StepStatus::Skipped,
+            "there is nothing to install"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&stamp).expect("stamp"),
+            stamped,
+            "a skipped rotation writes no new stamp"
+        );
+        assert_eq!(backup_count(&dir, "installed"), 0);
+
+        // 3. a real source change: cargo rebuilds and the rotation replaces.
+        std::fs::write(
+            dir.join("src/main.rs"),
+            "fn main() { println!(\"two\"); }\n",
+        )
+        .expect("edit");
+        let third = deploy(&context).run().expect("third deploy");
+        assert_eq!(third.steps[1].status, StepStatus::Success, "replaced");
+        assert_ne!(
+            std::fs::read_to_string(&stamp).expect("stamp"),
+            stamped,
+            "a real install refreshes the stamp"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2189,18 +2379,68 @@ mod tests {
         ));
         let lock = crate::context::DeployLock::acquire(&state_dir, "test-binary").expect("lock");
         assert!(lock.path().is_file());
+        assert_eq!(
+            lock.took_over(),
+            None,
+            "a fresh lock is ours, not taken over"
+        );
 
         let error = crate::context::DeployLock::acquire(&state_dir, "test-binary")
             .expect_err("second lock must fail");
+        let text = format!("{error:#}");
+        assert!(text.contains("deployment already running"), "error: {text}");
         assert!(
-            format!("{error:#}").contains("deployment already running"),
-            "error: {error:#}"
+            text.contains(&format!("pid {}", std::process::id())),
+            "the running deployment's pid is named: {text}"
         );
 
         drop(lock);
         let lock = crate::context::DeployLock::acquire(&state_dir, "test-binary")
             .expect("lock after release");
         drop(lock);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn a_lock_left_behind_by_a_killed_deployment_is_taken_over() {
+        let state_dir = temp_workspace("stale-lock");
+        let path = state_dir.join("test-binary.deploy.lock");
+        std::fs::write(&path, "pid=999999\n").expect("stale lock");
+        let old = std::time::SystemTime::now()
+            - crate::context::STALE_LOCK_AFTER
+            - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open lock")
+            .set_modified(old)
+            .expect("backdate the lock");
+
+        let lock = crate::context::DeployLock::acquire(&state_dir, "test-binary")
+            .expect("a stale lock is taken over");
+        assert_eq!(lock.took_over(), Some(999999));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("lock"),
+            format!("pid={}\n", std::process::id()),
+            "the takeover owns the lock from now on"
+        );
+        drop(lock);
+        assert!(!path.exists(), "the takeover removes the lock it owns");
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn dropping_a_lock_taken_over_by_someone_else_leaves_it_alone() {
+        let state_dir = temp_workspace("foreign-lock");
+        let path = state_dir.join("test-binary.deploy.lock");
+        let lock = crate::context::DeployLock::acquire(&state_dir, "test-binary").expect("lock");
+
+        std::fs::write(&path, "pid=1\n").expect("another deployment took over");
+        drop(lock);
+        assert!(
+            path.is_file(),
+            "a lock that records someone else's pid is not ours to delete"
+        );
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
@@ -2289,6 +2529,20 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    /// How many `<binary>.old-*` backups a rotation left in `dir`.
+    fn backup_count(dir: &std::path::Path, binary: &str) -> usize {
+        std::fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{binary}.old"))
+            })
+            .count()
     }
 
     /// A workspace with build inputs, a matching built/installed "binary" and

@@ -1,6 +1,49 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
+
+The staleness decision moves to the tools that own it - cargo decides whether
+there is anything to build, the rotation decides whether there is anything to
+install - and the deploy command of a checkout collapses into one call. The
+behaviour change is in the default plan; the old comparison stays available as
+`DeployBuilder::idempotent_skip(true)`.
+
+### Cargo decides what is stale
+
+- The default plan no longer compares a build-input list before the build. The
+  build step always runs - cargo no-ops on its own fingerprints, which cover
+  `include_bytes!` / `include_str!` files, `build.rs` rerun inputs, features,
+  profile, `RUSTFLAGS`, and the toolchain - and the rotation is a no-op when the
+  built binary and the installed one hold the same bytes.
+- A rotation with nothing to install reports `StepStatus::Skipped`; the
+  post-install verification and the stamp write are skipped with it, so
+  `<binary>.stamp` keeps describing the last real install.
+- The before-the-build comparison stays available as
+  `DeployBuilder::idempotent_skip(true)`; it is no longer the default.
+  `TargetStatus::Skipped` in a batch report now also covers "the rotation found
+  nothing to install".
+- `STALE_LOCK_AFTER` (10 minutes): a deployment lock left behind by a killed
+  deployment is taken over instead of blocking every later deploy. A fresh lock
+  names the owning pid and refuses, and dropping a lock that another deployment
+  took over leaves the file alone.
+
+### One-call checkout deploys
+
+- `DeployArgs`: the complete deploy argument surface (queue switches plus the
+  common flags) as one flattens-anywhere type, so a consumer no longer writes
+  its own struct with two `#[command(flatten)]` fields.
+- `DeployContext::for_checkout` and `checkout_state_dir`: `from_args` plus the
+  conventions a checkout deploy uses (release build unless `--profile`, state,
+  locks, stamps, and logs in `<root>/target/codex-deploy`, and a rotation that
+  sweeps the backups it replaced). Every convention is a default the matching
+  flag overrides.
+- `run_deploy` / `DeployOutcome`: the whole deploy command in one call -
+  conventions, the `--background` queue with its `queued <packages> redeploy
+  (pid=...)` line, and one plan per package, failing fast.
+- `#[deploy_commands(Deploy, packages = ["my-app"])]` writes the variant *and*
+  the dispatcher for that command, turning a 0.2.1-era xtask deploy (context
+  setup, queue branch, root/package helpers: ~80 lines) into the attribute plus
+  one match arm. `packages` cannot be combined with `args`/`handler`.
 
 ### Documentation
 

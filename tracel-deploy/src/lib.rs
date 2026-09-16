@@ -13,6 +13,9 @@
 //! - [`background`] queues a redeploy into a detached child process
 //!   (`--background` / `--child`), the shape a per-turn Codex `Stop` hook
 //!   needs: the hook returns at once and the child builds behind it.
+//! - [`run_deploy`] is the whole `deploy` command of a checkout that deploys
+//!   what it contains: the [`DeployContext::for_checkout`] conventions, the
+//!   queue, and the plan, in one call.
 //!
 //! The proc-macro [`deploy_commands`] mirrors `tracel_xtask_macros::base_commands`:
 //! it adds a `Deploy` variant and optionally generates a
@@ -62,6 +65,7 @@
 
 pub mod background;
 pub mod batch;
+pub mod checkout;
 pub mod command;
 pub mod context;
 mod detach;
@@ -77,11 +81,12 @@ pub use background::{
 pub use batch::{
     BatchOptions, BatchReport, DeployTarget, TargetReport, TargetStatus, batch_deploy,
 };
-pub use command::DeployCmdArgs;
+pub use checkout::{DeployOutcome, run_deploy};
+pub use command::{DeployArgs, DeployCmdArgs};
 pub use context::{
     DEFAULT_BUILD_INPUTS, DeployContext, DeployContextBuilder, DeployLock, FileFingerprint,
-    Profile, build_inputs_fingerprint, build_inputs_fingerprint_with, content_matches,
-    file_fingerprint,
+    Profile, STALE_LOCK_AFTER, build_inputs_fingerprint, build_inputs_fingerprint_with,
+    checkout_state_dir, content_matches, file_fingerprint,
 };
 pub use plan::{
     CargoBuildStep, DeployBuilder, DeployHook, DeployHookEntry, DeployHookReport, DeployPlan,
@@ -114,16 +119,16 @@ pub mod prelude {
         wait_ready,
     };
     pub use crate::{
-        BatchOptions, BatchReport, CargoBuildStep, DEPLOY_ERROR_LOG, DEPLOY_LOG, DeployBuilder,
-        DeployCmdArgs, DeployContext, DeployContextBuilder, DeployHook, DeployHookEntry,
-        DeployHookReport, DeployLock, DeployPlan, DeployQueueArgs, DeployReport, DeployStep,
-        DeployStepReport, DeployTarget, DeploymentLogs, FileFingerprint, NullReporter, Profile,
-        Reporter, RotateOptions, RotateOutcome, RotateStep, RotateStrategy, RunOutcome, RunStep,
-        StdoutReporter, StepStatus, TargetReport, TargetStatus, batch_deploy,
-        build_inputs_fingerprint, build_inputs_fingerprint_with, child_argv,
+        BatchOptions, BatchReport, CargoBuildStep, DEPLOY_ERROR_LOG, DEPLOY_LOG, DeployArgs,
+        DeployBuilder, DeployCmdArgs, DeployContext, DeployContextBuilder, DeployHook,
+        DeployHookEntry, DeployHookReport, DeployLock, DeployOutcome, DeployPlan, DeployQueueArgs,
+        DeployReport, DeployStep, DeployStepReport, DeployTarget, DeploymentLogs, FileFingerprint,
+        NullReporter, Profile, Reporter, RotateOptions, RotateOutcome, RotateStep, RotateStrategy,
+        RunOutcome, RunStep, StdoutReporter, StepStatus, TargetReport, TargetStatus, batch_deploy,
+        build_inputs_fingerprint, build_inputs_fingerprint_with, checkout_state_dir, child_argv,
         codex_stop_hook_command, codex_stop_hook_json, content_matches, deploy, file_fingerprint,
         queue_deploy, queue_executable, read_state_file, remove_state_file, resolve_install_path,
-        rotate, same_file_path, write_state_file,
+        rotate, run_deploy, same_file_path, write_state_file,
     };
     pub use tracel_deploy_macros::deploy_commands;
     pub use tracel_xtask::prelude::{Context, Environment, XtaskArgs};

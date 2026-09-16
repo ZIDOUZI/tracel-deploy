@@ -9,9 +9,9 @@
 //!    `--child`, and [`queue_deploy`] re-spawns the same executable - detached,
 //!    with that argv - redirecting stdout to `<state_dir>/deploy.log` and stderr
 //!    to `<state_dir>/deploy-error.log`, and returns the child's pid at once.
-//! 3. The child runs the ordinary plan, so the deployment stamp skips it when
-//!    nothing changed, the lock keeps two deployments of one binary apart, and a
-//!    real change is built, rotated, verified, and stamped.
+//! 3. The child runs the ordinary plan: cargo decides whether there is anything
+//!    to build, the rotation is a no-op while the installed binary is already
+//!    that build output, and a real change is rotated, verified, and stamped.
 //!
 //! [`DeployQueueArgs`] carries the two switches and [`child_argv`] builds the
 //! child's command line, so a consumer's `deploy` command needs no argv

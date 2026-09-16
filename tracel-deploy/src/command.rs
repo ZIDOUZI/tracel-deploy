@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::background::DeployQueueArgs;
+
 /// Common command line arguments for a deployment command.
 ///
 /// Project-specific commands can flatten this into their own args struct:
@@ -21,7 +23,8 @@ pub struct DeployCmdArgs {
     /// Print the plan without building, installing, or changing a service.
     #[arg(long)]
     pub dry_run: bool,
-    /// Force deployment even when a target-specific stamp says it is current.
+    /// Run the full plan, including a rotation whose installed binary is
+    /// already the built one.
     #[arg(long)]
     pub force: bool,
     /// Suppress normal progress output.
@@ -75,4 +78,31 @@ pub struct DeployCmdArgs {
     /// Extra arguments forwarded to `cargo build` after `--`.
     #[arg(last = true)]
     pub build_args: Vec<String>,
+}
+
+/// The complete `deploy` argument surface: the queue switches a hook-driven
+/// deploy needs plus the common deployment flags.
+///
+/// This is the args type [`deploy_commands`](crate::deploy_commands) uses when
+/// it generates the command for you (`packages = [...]`) and the type
+/// [`run_deploy`](crate::run_deploy) takes. Flatten it into a
+/// project-specific struct when the command needs extra flags:
+///
+/// ```ignore
+/// #[derive(clap::Args, Clone, Debug)]
+/// pub struct MyDeployArgs {
+///     #[command(flatten)]
+///     pub deploy: tracel_deploy::DeployArgs,
+///     #[arg(long, value_name = "SECS")]
+///     pub verify_timeout: Option<u64>,
+/// }
+/// ```
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeployArgs {
+    /// `--background` / `--child`: queue the deployment instead of running it.
+    #[command(flatten)]
+    pub queue: DeployQueueArgs,
+    /// The shared build, install, rotation, and state flags.
+    #[command(flatten)]
+    pub common: DeployCmdArgs,
 }

@@ -2,7 +2,7 @@ use std::{
     env, fs,
     io::Write,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context as _, Result};
@@ -144,6 +144,40 @@ impl DeployContext {
         context.target_dir = args.target_dir.clone();
         context.features = args.features.clone();
         context.no_default_features = args.no_default_features;
+        Ok(context)
+    }
+
+    /// [`from_args`](Self::from_args) plus the conventions a checkout deploy
+    /// uses when it deploys what the repository contains:
+    ///
+    /// - **release build**: unless `--profile <name>` picks another profile, the
+    ///   binary is built and installed as a release build (`--release` is
+    ///   implied),
+    /// - **state next to the logs**: unless `--state-dir` is given, state,
+    ///   locks, stamps, and the queued run's logs live in
+    ///   [`checkout_state_dir`],
+    /// - **rotation sweeps what it replaced**: unless `--backup-retention` or
+    ///   `--backup-max-age-days` is given, the rotation keeps no
+    ///   `<binary>.old-*` files behind.
+    ///
+    /// Every convention is only a default: the matching flag, or a field set on
+    /// the returned context, wins.
+    pub fn for_checkout(
+        args: &DeployCmdArgs,
+        workspace_root: impl Into<PathBuf>,
+        package: impl Into<String>,
+    ) -> Result<Self> {
+        let workspace_root = workspace_root.into();
+        let mut context = Self::from_args(args, workspace_root.clone(), package)?;
+        if args.profile.is_none() {
+            context.release = true;
+        }
+        if args.state_dir.is_none() {
+            context.state_dir = checkout_state_dir(&workspace_root);
+        }
+        if args.backup_retention.is_none() && args.backup_max_age_days.is_none() {
+            context.backup_retention = Some(0);
+        }
         Ok(context)
     }
 
@@ -370,6 +404,17 @@ pub fn default_cargo_bin_dir() -> PathBuf {
     PathBuf::from(home).join(".cargo").join("bin")
 }
 
+/// Deployment state, locks, stamps, and the queued run's logs for one checkout:
+/// `<workspace_root>/target/codex-deploy`.
+///
+/// The directory [`DeployContext::for_checkout`] and
+/// [`run_deploy`](crate::run_deploy) use unless `--state-dir` says otherwise.
+/// It sits inside `target/`, so `cargo clean` removes the state together with
+/// the build output.
+pub fn checkout_state_dir(workspace_root: &Path) -> PathBuf {
+    workspace_root.join("target").join("codex-deploy")
+}
+
 pub fn default_state_dir() -> PathBuf {
     #[cfg(windows)]
     {
@@ -570,16 +615,28 @@ fn relative_input_name(root: &Path, path: &Path) -> String {
     relative.to_string_lossy().replace('\\', "/")
 }
 
+/// How old a lock file must be before [`DeployLock::acquire`] treats it as the
+/// leftovers of a killed deployment and takes it over.
+///
+/// This is a heuristic, because nothing refreshes the file while a deployment
+/// runs: a build that legitimately takes longer than the threshold can be taken
+/// over. That is safe here - the takeover only decides *who* deploys: cargo
+/// serializes builds of one target directory, and a rotation that finds the
+/// installed binary already equal to the built one is a no-op.
+pub const STALE_LOCK_AFTER: Duration = Duration::from_secs(600);
+
 /// Deployment lock stored inside the context `state_dir`.
 ///
-/// The lock is created with `create_new` so two deployments of the same
-/// binary cannot rotate it at the same time. It is removed on drop, including
-/// failure paths; if a previous deployment crashed, delete the lock file
-/// manually (its path is part of the error message).
+/// The lock is created with `create_new`, so two deployments of the same binary
+/// cannot rotate it at the same time, and it is removed on drop, including
+/// failure paths. A lock a killed deployment left behind (no `Drop`, no chance
+/// to clean up) is taken over once it is older than [`STALE_LOCK_AFTER`]; a
+/// fresh lock reports the owning pid and refuses.
 #[derive(Debug)]
 pub struct DeployLock {
     path: PathBuf,
     _file: fs::File,
+    took_over: Option<u32>,
 }
 
 impl DeployLock {
@@ -594,25 +651,83 @@ impl DeployLock {
         {
             Ok(mut file) => {
                 let _ = writeln!(file, "pid={}", std::process::id());
-                Ok(Self { path, _file: file })
+                Ok(Self {
+                    path,
+                    _file: file,
+                    took_over: None,
+                })
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => anyhow::bail!(
-                "deployment already running (lock: {}); delete the file if the previous deploy crashed",
-                path.display()
-            ),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Self::take_over_if_stale(path)
+            }
             Err(error) => Err(error)
                 .with_context(|| format!("could not create deployment lock {}", path.display())),
         }
     }
 
+    /// Takes the lock over when the existing one is stale, refuses otherwise.
+    fn take_over_if_stale(path: PathBuf) -> Result<Self> {
+        let age = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+        let owner = lock_owner(&path);
+        if age.is_none_or(|age| age < STALE_LOCK_AFTER) {
+            let owner = owner.map(|pid| format!(", pid {pid}")).unwrap_or_default();
+            anyhow::bail!(
+                "deployment already running (lock: {}{owner}); a lock left behind by a killed \
+                 deployment is taken over {} minutes after it was written",
+                path.display(),
+                STALE_LOCK_AFTER.as_secs() / 60
+            );
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .with_context(|| {
+                format!(
+                    "could not take over the stale deployment lock {}",
+                    path.display()
+                )
+            })?;
+        writeln!(file, "pid={}", std::process::id())
+            .with_context(|| format!("could not write the deployment lock {}", path.display()))?;
+        Ok(Self {
+            path,
+            _file: file,
+            took_over: owner,
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// The pid recorded by the lock this deployment took over; `None` when it
+    /// created the lock itself.
+    pub fn took_over(&self) -> Option<u32> {
+        self.took_over
+    }
+}
+
+/// The `pid=…` a lock file records, when it parses.
+fn lock_owner(path: &Path) -> Option<u32> {
+    let contents = fs::read_to_string(path).ok()?;
+    contents
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pid="))
+        .and_then(|pid| pid.trim().parse().ok())
 }
 
 impl Drop for DeployLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // Take the lock away only while it still records this process: a
+        // deployment that took the stale lock over owns the file from then on,
+        // and its own drop removes it.
+        if lock_owner(&self.path) == Some(std::process::id()) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 

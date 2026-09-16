@@ -43,6 +43,39 @@ remaining `base_commands` attribute.
 arguments. Without `handler`, the macro only adds the variant; dispatch it
 yourself.
 
+### One-line deploys
+
+A checkout that deploys what it contains (build this workspace's binary or
+binaries, rotate them into the Cargo bin directory, skip when nothing changed)
+needs neither `args` nor `handler`: `packages = [..]` writes the variant *and*
+the body.
+
+```rust
+#[tracel_deploy::deploy_commands(Deploy, packages = ["my-app"])]
+#[macros::base_commands(Build, Check, Test)]
+pub enum Command {}
+
+fn main() -> anyhow::Result<()> {
+    let (args, environment) = init_xtask::<Command>(parse_args::<Command>()?)?;
+    match args.command {
+        Command::Deploy(command) => handle_deploy_command(command, environment, args.context),
+        _ => dispatch_base_commands(args, environment),
+    }
+}
+```
+
+The generated dispatcher takes the workspace root from the xtask crate's
+`CARGO_MANIFEST_DIR` (the xtask lives in `<root>/xtask`), runs
+`tracel_deploy::run_deploy` for the listed packages, and prefixes a failure with
+`<xtask crate> deploy: ` so the deploy log stays greppable. `run_deploy` is the
+whole command: the `DeployContext::for_checkout` conventions (release build,
+state and logs in `<root>/target/codex-deploy`, a rotation that sweeps the
+backups it replaced), the `--background` queue, and the plan. Pass more than one
+package to deploy several binaries in one call; flags that name a single binary
+(`--package`, `--binary`, `--install-to`, `--backup-dir`, `--source`) are
+rejected for several packages, and anything beyond that convention wants
+`DeployContext` / `batch_deploy` explicitly.
+
 ### tracel-xtask versions
 
 The dependency is a floor with no upper bound (`tracel-xtask = ">=0.3"`), so
@@ -106,32 +139,43 @@ profile, target triple, target directory, and features
 
 ## Idempotent Deploys
 
-Default plans are idempotent, and the decision is made *before* the build from
-the deployment stamp in `state_dir`. A skip requires both halves of the proof:
+Default plans are idempotent, and each half of the question is answered by the
+tool that owns it:
 
-- the build inputs (`src/**`, `Cargo.toml`, `Cargo.lock`, `build.rs`,
-  `rust-toolchain*`, `.cargo/config.toml`) still hash to the
-  `build_inputs_fingerprint` recorded by the stamp (see
-  `build_inputs_fingerprint` / `build_inputs_fingerprint_with`), and
-- the installed binary still matches the destination fingerprint recorded by
-  the stamp.
+- **Is the build output stale?** cargo decides. The build step always runs, and
+  cargo no-ops when its own fingerprints say there is nothing to compile - the
+  fingerprints that know about `include_bytes!` / `include_str!` files,
+  `build.rs` rerun inputs, features, profile, `RUSTFLAGS`, and the toolchain.
+  `tracel-deploy` does not keep a second, partial list of build inputs.
+- **Is the installed binary that build output?** the rotation decides, by
+  comparing the built binary with the installed one (size and content hash).
+  Identical bytes mean the install is current: nothing is copied, no backup is
+  created, and a running binary is left alone (on Windows the rotation would
+  otherwise rename it aside on every run).
 
-Only then is the whole plan skipped (`StepStatus::Skipped`) and the destination
-left untouched. Because the comparison uses the recorded *build inputs* rather
-than the build output on disk, a changed source tree with a stale build output
-is never mistaken for "up to date"; a missing or legacy stamp never skips, and
-`force = true` / `--force` always runs the full plan.
+A rotation with nothing to install reports `StepStatus::Skipped`, and the
+post-install verification and the stamp write are skipped with it - so the stamp
+keeps describing the last *real* install (`deployed_at`, the source and
+destination fingerprints, and the build-input fingerprint of that moment).
+`force = true` / `--force` runs the full plan, including a rotation that would
+otherwise be a no-op.
 
-Callers that replaced the default plan (`without_defaults()`) can opt into the
-same behaviour with `DeployBuilder::idempotent_skip`, `verify_install`, and
-`write_deploy_stamp`. Those switches default to the old behaviour: on for the
-default plan, off when the caller takes over the plan.
+Consumers that would rather not start cargo at all can opt into the older
+*before-the-build* comparison with `DeployBuilder::idempotent_skip(true)`: it
+skips the whole plan when the installed binary still matches the stamp **and**
+the build inputs still hash to the recorded `build_inputs_fingerprint`. That is
+cheaper, but the list (`src/**`, `Cargo.toml`, `Cargo.lock`, `build.rs`,
+`rust-toolchain*`, `.cargo/config.toml`, or what the caller passes to
+`build_inputs_fingerprint_with`) is only as complete as the caller makes it:
+features, profile, `RUSTFLAGS`, or an `include_bytes!` file outside it do not
+trigger a redeploy. A missing or legacy stamp never skips.
 
 Every non-dry-run deployment takes a lock in `state_dir`
 (`<binary>.deploy.lock`), so two deployments of the same binary cannot rotate it
-concurrently; the lock error names the file to delete after a crashed deploy.
-After a successful rotation the installed binary is verified against the source
-(content hash, size, and - on Unix - the executable bit), and a
+concurrently. A lock a killed deployment left behind is taken over once it is
+older than `STALE_LOCK_AFTER` (10 minutes); a fresh one reports the owning pid
+and refuses. After a real rotation the installed binary is verified against the
+source (content hash, size, and - on Unix - the executable bit), and a
 `<binary>.stamp` file with the build-input, source, and destination fingerprints
 is written to `state_dir` for diagnostics.
 
@@ -298,9 +342,9 @@ run in it:
    and `queue_deploy` re-spawns the same executable detached with that command
    line, stdout and stderr redirected to `<state_dir>/deploy.log` and
    `<state_dir>/deploy-error.log`, and returns the child pid at once;
-3. the child runs the ordinary plan, so the stamp skips an unchanged checkout,
-   the lock keeps two deployments of one binary apart, and a real change is
-   built, rotated, verified, and stamped.
+3. the child runs the ordinary plan, so cargo decides whether there is anything
+   to build, the rotation is a no-op while the installed binary is already that
+   build output, and a real change is built, rotated, verified, and stamped.
 
 A consumer's `deploy` command therefore needs four lines rather than its own
 argv rewriting, log handling, and detached spawn. `queue_deploy` uses the `argv`

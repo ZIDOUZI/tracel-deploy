@@ -345,15 +345,21 @@ pub fn batch_deploy(
     Ok(report)
 }
 
-/// A deploy report whose every step was skipped is the idempotent
-/// short-circuit: nothing was rebuilt or installed because nothing changed.
+/// A deploy report with nothing to install is the idempotent short-circuit:
+/// either every step was skipped (the opt-in pre-build comparison), or the
+/// rotation found the installed binary already equal to the built one (the
+/// default, where cargo decides whether there is anything to build).
 fn status_of(report: &DeployReport) -> TargetStatus {
     let skipped = !report.steps.is_empty()
         && report
             .steps
             .iter()
             .all(|step| step.status == StepStatus::Skipped);
-    if skipped {
+    let rotation_skipped = report
+        .steps
+        .iter()
+        .any(|step| step.name == "rotate" && step.status == StepStatus::Skipped);
+    if skipped || rotation_skipped {
         TargetStatus::Skipped
     } else {
         TargetStatus::Succeeded
@@ -615,13 +621,13 @@ mod tests {
         let deploy = second.targets[0]
             .deploy
             .as_ref()
-            .expect("a skipped target reports the skipped steps");
+            .expect("a skipped target reports its steps");
         assert!(
             deploy
                 .steps
                 .iter()
-                .all(|step| step.status == StepStatus::Skipped),
-            "steps: {deploy:?}"
+                .any(|step| step.name == "rotate" && step.status == StepStatus::Skipped),
+            "nothing was installed, so the rotation is skipped: {deploy:?}"
         );
         let after = fs::metadata(&fixture.destination)
             .expect("metadata")
@@ -663,8 +669,8 @@ mod tests {
             direct_again
                 .steps
                 .iter()
-                .all(|step| step.status == StepStatus::Skipped),
-            "steps: {direct_again:?}"
+                .any(|step| step.name == "rotate" && step.status == StepStatus::Skipped),
+            "the install is already current: {direct_again:?}"
         );
         let batch_again = batch_deploy(&batched.dir, &[batched.target("pkg-a")], batched.options())
             .expect("second batch deploy");
