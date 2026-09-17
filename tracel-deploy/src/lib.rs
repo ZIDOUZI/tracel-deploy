@@ -73,6 +73,7 @@ pub mod plan;
 pub mod rotate;
 pub mod service;
 pub mod state;
+pub mod workspace;
 
 pub use background::{
     DEPLOY_ERROR_LOG, DEPLOY_LOG, DeployQueueArgs, DeploymentLogs, child_argv,
@@ -89,9 +90,9 @@ pub use context::{
     checkout_state_dir, content_matches, file_fingerprint,
 };
 pub use plan::{
-    CargoBuildStep, DeployBuilder, DeployHook, DeployHookEntry, DeployHookReport, DeployPlan,
-    DeployReport, DeployStep, DeployStepReport, NullReporter, Reporter, RotateStep, RunOutcome,
-    RunStep, StdoutReporter, StepStatus, StepVerify, deploy,
+    CargoBuildStep, DeployBuilder, DeployHook, DeployPlan, DeployReport, DeployStep,
+    DeployStepReport, Handler, NullReporter, Outcome, Phase, Reporter, RotateStep, RunOutcome,
+    RunState, RunStep, StdoutReporter, StepStatus, StepVerify, deploy, install_is_current,
 };
 pub use rotate::{
     BackupRetry, CleanupReport, DiscardedPending, PendingBackup, PendingDropReason, RotateOptions,
@@ -101,6 +102,7 @@ pub use state::{
     read_state_file, remove_state_file, resolve_install_path, same_file_path, write_state_file,
 };
 pub use tracel_deploy_macros::deploy_commands;
+pub use workspace::{DetectHint, WorkspaceRoot};
 
 #[doc(hidden)]
 pub mod __private {
@@ -113,18 +115,18 @@ pub mod prelude {
     pub use crate::rotate::{BackupRetry, CleanupReport, cleanup_pending_backups};
     #[cfg(feature = "service")]
     pub use crate::service::{
-        Instance, ProbeKind, ProbeReport, ProbeSpec, ServiceSpec, ServiceState, StopOutcome,
-        StopReport, executable_path, find_running_instance, is_alive, probe_once, resolve_binary,
-        start_and_wait_ready, start_detached, stop, stop_checked, stop_service, tail_log,
-        wait_ready,
+        Instance, ProbeKind, ProbeReport, ProbeSpec, ServiceSpec, ServiceStart, ServiceState,
+        ServiceStop, StopOutcome, StopReport, executable_path, find_running_instance, is_alive,
+        probe_once, resolve_binary, start_and_wait_ready, start_detached, stop, stop_checked,
+        stop_service, tail_log, wait_ready,
     };
     pub use crate::{
         BatchOptions, BatchReport, CargoBuildStep, DEPLOY_ERROR_LOG, DEPLOY_LOG, DeployArgs,
-        DeployBuilder, DeployCmdArgs, DeployContext, DeployContextBuilder, DeployHook,
-        DeployHookEntry, DeployHookReport, DeployLock, DeployOutcome, DeployPlan, DeployQueueArgs,
-        DeployReport, DeployStep, DeployStepReport, DeployTarget, DeploymentLogs, FileFingerprint,
-        NullReporter, Profile, Reporter, RotateOptions, RotateOutcome, RotateStep, RotateStrategy,
-        RunOutcome, RunStep, StdoutReporter, StepStatus, TargetReport, TargetStatus, batch_deploy,
+        DeployBuilder, DeployCmdArgs, DeployContext, DeployContextBuilder, DeployHook, DeployLock,
+        DeployOutcome, DeployPlan, DeployQueueArgs, DeployReport, DeployStep, DeployStepReport,
+        DeployTarget, DeploymentLogs, FileFingerprint, Handler, NullReporter, Outcome, Phase,
+        Profile, Reporter, RotateOptions, RotateOutcome, RotateStep, RotateStrategy, RunOutcome,
+        RunState, RunStep, StdoutReporter, StepStatus, TargetReport, TargetStatus, batch_deploy,
         build_inputs_fingerprint, build_inputs_fingerprint_with, checkout_state_dir, child_argv,
         codex_stop_hook_command, codex_stop_hook_json, content_matches, deploy, file_fingerprint,
         queue_deploy, queue_executable, read_state_file, remove_state_file, resolve_install_path,

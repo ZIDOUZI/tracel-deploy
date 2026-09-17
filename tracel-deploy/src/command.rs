@@ -30,6 +30,10 @@ pub struct DeployCmdArgs {
     /// Suppress normal progress output.
     #[arg(long)]
     pub quiet: bool,
+    /// Workspace the deployed packages belong to. Detected from the xtask crate
+    /// and the current directory when it is not given.
+    #[arg(long, value_name = "DIR")]
+    pub workspace: Option<PathBuf>,
     /// Crate/package to build.
     #[arg(long, value_name = "CRATE")]
     pub package: Option<String>,

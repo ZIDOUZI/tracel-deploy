@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "tracel-deploy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "tracel-deploy-macros"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proc-macro2",
  "quote",

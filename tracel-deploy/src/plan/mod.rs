@@ -1,216 +1,57 @@
 use std::{
-    fmt, fs,
-    io::Read,
+    fs,
     path::PathBuf,
-    process::{Child, Command, ExitStatus, Stdio},
-    sync::Arc,
-    thread::JoinHandle,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result};
 
-use crate::{
-    context::{
-        DeployContext, DeployLock, FileFingerprint, STALE_LOCK_AFTER, build_inputs_fingerprint,
-        content_matches, file_fingerprint,
-    },
-    rotate::{RotateOptions, RotateOutcome, RotateStrategy, rotate},
+use crate::context::{
+    DeployContext, DeployLock, FileFingerprint, STALE_LOCK_AFTER, build_inputs_fingerprint,
+    file_fingerprint,
 };
+
+pub mod phase;
+
+pub use phase::{Handler, Outcome, Phase, RunState};
 
 pub type DeployHook = Box<dyn FnMut(&DeployContext) -> Result<()>>;
 
-/// A hook plus the optional name used in errors and reports.
-pub struct DeployHookEntry {
-    pub name: Option<String>,
-    pub hook: DeployHook,
-}
+mod report;
+mod steps;
 
-impl DeployHookEntry {
-    fn new(name: Option<String>, hook: DeployHook) -> Self {
-        Self { name, hook }
-    }
+pub use report::{
+    DeployEventReport, DeployReport, DeployStepReport, NullReporter, Reporter, StdoutReporter,
+    StepStatus,
+};
+pub use steps::{
+    CargoBuildStep, DeployStep, RotateStep, RunOutcome, RunStep, StepVerify, install_is_current,
+};
 
-    fn label(&self, phase: &str, index: usize) -> String {
-        self.name
-            .clone()
-            .unwrap_or_else(|| format!("{phase} hook #{}", index + 1))
-    }
-}
+use report::default_reporter;
 
-/// Where a deploy plan sends its human-readable output.
+/// A composable deployment plan: the timeline of `(phase, handler)` entries.
 ///
-/// Every message the library prints goes through a reporter: a
-/// [`StdoutReporter`] by default (the 0.1.0 output), a [`NullReporter`] for a
-/// fully silent deploy, or a caller-owned implementation for logs, structured
-/// events, or a CI summary. [`DeployBuilder::reporter`] injects one.
-///
-/// Every method has a no-op default, so an implementation can react to only the
-/// events it cares about. An injected reporter replaces the `quiet` handling:
-/// it runs even for a context with `quiet` set.
-///
-/// ```ignore
-/// use tracel_deploy::plan::{DeployStepReport, Reporter};
-///
-/// #[derive(Default)]
-/// struct Summary {
-///     steps: Vec<String>,
-/// }
-///
-/// impl Reporter for Summary {
-///     fn step_finished(&mut self, report: &DeployStepReport) {
-///         self.steps.push(format!("{}: {:?}", report.name, report.status));
-///     }
-/// }
-///
-/// tracel_deploy::deploy(&context)
-///     .reporter(Summary::default())
-///     .run()?;
-/// ```
-pub trait Reporter {
-    /// The dry-run plan: one line per hook and step that would run, in
-    /// execution order, the same lines as [`DeployReport::plan`].
-    /// [`StdoutReporter`] renders each line as `would: <line>` unless it is
-    /// quiet.
-    fn plan(&mut self, lines: &[String]) {
-        let _ = lines;
-    }
-
-    /// A step is about to run. `description` is the single line of
-    /// [`DeployStep::describe`]; `name` is the name the step reports itself
-    /// under, for example `cargo build` or `run my-service`.
-    ///
-    /// [`StdoutReporter`] prints nothing here: the steps that echoed a line in
-    /// 0.1.0 report that line through [`Reporter::note`] instead, so a reporter
-    /// that prints both would print it twice.
-    fn step_started(&mut self, name: &str, description: &str) {
-        let _ = (name, description);
-    }
-
-    /// A message without step context: the cargo command line and the `run …`
-    /// description a step echoes before it runs, and the idempotent-skip
-    /// notice. [`StdoutReporter`] prints these lines to stdout unless it is
-    /// quiet.
-    fn note(&mut self, message: &str) {
-        let _ = message;
-    }
-
-    /// A step finished and produced a report; a step that failed returns an
-    /// error instead, so no report reaches the reporter.
-    fn step_finished(&mut self, report: &DeployStepReport) {
-        let _ = report;
-    }
-
-    /// A non-fatal problem: the deploy succeeded but something around it did
-    /// not (for example a deployment stamp that could not be written).
-    /// [`StdoutReporter`] writes these to stderr and `quiet` does not suppress
-    /// them; use [`NullReporter`] for complete silence.
-    fn warning(&mut self, message: &str) {
-        let _ = message;
-    }
-}
-
-/// The default reporter: the stdout behaviour of 0.1.0.
-///
-/// The cargo command line, the `run …` description, and the skip notice are
-/// printed to stdout, the dry-run plan as `would: <line>` lines, and warnings
-/// to stderr. A quiet reporter suppresses every stdout line (that is what
-/// `DeployContext::quiet` maps onto) but still writes warnings to stderr.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct StdoutReporter {
-    quiet: bool,
-}
-
-impl StdoutReporter {
-    /// A reporter that prints the deploy progress.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// A reporter that prints nothing to stdout, like a context with `quiet`.
-    pub fn quiet() -> Self {
-        Self { quiet: true }
-    }
-
-    /// Map a `quiet` flag (for example [`DeployContext::quiet`]) onto a
-    /// reporter.
-    pub fn with_quiet(quiet: bool) -> Self {
-        Self { quiet }
-    }
-
-    /// Whether the stdout lines are suppressed.
-    pub fn is_quiet(&self) -> bool {
-        self.quiet
-    }
-}
-
-impl Reporter for StdoutReporter {
-    fn plan(&mut self, lines: &[String]) {
-        if self.quiet {
-            return;
-        }
-        for line in lines {
-            println!("would: {line}");
-        }
-    }
-
-    fn note(&mut self, message: &str) {
-        if !self.quiet {
-            println!("{message}");
-        }
-    }
-
-    fn warning(&mut self, message: &str) {
-        eprintln!("warning: {message}");
-    }
-}
-
-/// A reporter that discards every message: a fully silent deploy for a caller
-/// that consumes [`DeployReport`] (or the exit status) instead of the output.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NullReporter;
-
-impl Reporter for NullReporter {}
-
-/// The reporter used when the caller does not inject one.
-fn default_reporter(context: &DeployContext) -> StdoutReporter {
-    StdoutReporter::with_quiet(context.quiet)
-}
-
-/// A composable deployment plan.
-///
-/// Execution order:
+/// Execution order - the same for the default plan, a caller-owned plan, and a
+/// plan that mixes handlers with built-in steps:
 ///
 /// ```text
-/// pre hooks -> steps -> post hooks -> finally hooks
+/// preflight (dry run only) -> pre -> build -> after-build -> rotate
+///     -> after-rotate -> post -> on-error (only after a failure) -> finally (always)
 /// ```
 ///
-/// [`preflight`](DeployPlan::preflight) hooks are the exception: they run only
-/// during a dry run, for read-only checks, and the rendered plan is reported
-/// after them. A real deploy never runs them.
-///
-/// On success every phase runs in order. On failure the failing phase stops,
-/// `post` hooks are skipped, and the `on_error` and `finally` hooks still run.
-/// `finally` hooks always run (also when `on_error` fails) and every failure is
-/// aggregated, with the original error kept first in the chain.
+/// Entries registered at the same phase run in registration order, and a phase
+/// without entries is skipped. On failure the failing **step** stops the rest of
+/// its phase and every later phase except `on-error` and `finally`; a failing
+/// handler does not stop the rest of its own phase (the 0.3 hook behaviour).
 pub struct DeployPlan {
-    pub preflight: Vec<DeployHookEntry>,
-    pub pre: Vec<DeployHookEntry>,
-    pub steps: Vec<DeployStep>,
-    pub post: Vec<DeployHookEntry>,
-    pub on_error: Vec<DeployHookEntry>,
-    pub finally: Vec<DeployHookEntry>,
+    entries: Vec<(Phase, Handler)>,
 }
 
 impl DeployPlan {
     pub fn new() -> Self {
         Self {
-            preflight: Vec::new(),
-            pre: Vec::new(),
-            steps: Vec::new(),
-            post: Vec::new(),
-            on_error: Vec::new(),
-            finally: Vec::new(),
+            entries: Vec::new(),
         }
     }
 
@@ -222,24 +63,60 @@ impl DeployPlan {
         ]
     }
 
-    /// One line per hook and step describing what would run, in execution
-    /// order (used by dry-run and reports).
+    /// Register `handler` at `phase`.
+    pub fn push(&mut self, phase: Phase, handler: impl Into<Handler>) {
+        self.entries.push((phase, handler.into()));
+    }
+
+    /// Register a built-in step at `phase`.
+    pub fn push_step(&mut self, phase: Phase, step: DeployStep) {
+        self.push(phase, step);
+    }
+
+    /// The handlers registered at `phase`, in registration order.
+    pub fn handlers(&self, phase: Phase) -> impl Iterator<Item = &Handler> {
+        self.entries
+            .iter()
+            .filter(move |(entry_phase, _)| *entry_phase == phase)
+            .map(|(_, handler)| handler)
+    }
+
+    /// Whether the plan has no entries at all.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Put `entries` in front of the plan: the default build and rotation are
+    /// registered first, so a handler a caller added at the same phase runs
+    /// after them.
+    pub(crate) fn prepend(&mut self, mut entries: Vec<(Phase, Handler)>) {
+        entries.append(&mut self.entries);
+        self.entries = entries;
+    }
+
+    /// One line per entry describing what would run, in execution order.
     ///
-    /// A named hook renders as `<phase>: <name>` (`pre: stop service`), an
-    /// unnamed one as `<phase> hook #<n>` (`pre hook #1`), and a step renders
-    /// as [`DeployStep::describe`]. `preflight` hooks only run during a dry
-    /// run, so they are only listed when `context.dry_run` is set.
+    /// A built-in step renders as [`DeployStep::describe`], a handler as
+    /// [`Handler::render`] (`after-build: stop my-service`). The deprecated 0.3
+    /// builder methods keep the exact 0.3 lines (`pre: stop service`,
+    /// `pre hook #1`).
     pub fn render(&self, context: &DeployContext) -> Vec<String> {
         let mut lines = Vec::new();
         if context.dry_run {
-            push_hook_plan_lines(&mut lines, "preflight", &self.preflight);
+            lines.extend(self.lines_for(Phase::Preflight, context));
         }
-        push_hook_plan_lines(&mut lines, "pre", &self.pre);
-        lines.extend(self.steps.iter().map(|step| step.describe(context)));
-        push_hook_plan_lines(&mut lines, "post", &self.post);
-        push_hook_plan_lines(&mut lines, "on_error", &self.on_error);
-        push_hook_plan_lines(&mut lines, "finally", &self.finally);
+        for phase in Phase::ORDER {
+            lines.extend(self.lines_for(phase, context));
+        }
         lines
+    }
+
+    fn lines_for(&self, phase: Phase, context: &DeployContext) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|(entry_phase, _)| *entry_phase == phase)
+            .map(|(entry_phase, handler)| handler.render(*entry_phase, context))
+            .collect()
     }
 
     pub fn run(self, context: &DeployContext) -> Result<DeployReport> {
@@ -256,70 +133,117 @@ impl DeployPlan {
         context: &DeployContext,
         reporter: &mut dyn Reporter,
     ) -> Result<DeployReport> {
+        self.run_with_state(context, reporter)
+            .map(|(report, _state)| report)
+    }
+
+    /// [`run_with`](Self::run_with), plus what the run learned: a caller that
+    /// has to act on "nothing was installed" or on the service instance reads
+    /// the returned [`RunState`].
+    pub(crate) fn run_with_state(
+        self,
+        context: &DeployContext,
+        reporter: &mut dyn Reporter,
+    ) -> Result<(DeployReport, RunState)> {
         let mut report = DeployReport {
             installed: context.install_path.clone(),
             dry_run: context.dry_run,
             plan: Vec::new(),
-            steps: Vec::new(),
-            hooks: Vec::new(),
+            events: Vec::new(),
         };
+        let mut state = RunState::default();
+
         if context.dry_run {
             // The plan is rendered before the checks run so that it can be
-            // reported even when a preflight hook fails.
+            // reported even when a preflight check fails.
             let plan = self.render(context);
             let mut failures = Vec::new();
-            run_hook_phase(
-                "preflight",
-                self.preflight,
-                context,
-                &mut report,
-                &mut failures,
-            );
+            for (phase, mut handler) in self
+                .entries
+                .into_iter()
+                .filter(|(phase, _)| *phase == Phase::Preflight)
+            {
+                run_check(
+                    phase,
+                    &mut handler,
+                    context,
+                    reporter,
+                    &mut report,
+                    &mut state,
+                    &mut failures,
+                );
+            }
             report.plan = plan;
             reporter.plan(&report.plan);
             if !failures.is_empty() {
-                return Err(preflight_failure(failures, &report.hooks, &report.plan));
+                return Err(preflight_failure(failures, &report.events, &report.plan));
             }
-            return Ok(report);
+            return Ok((report, state));
         }
 
-        // Preflight hooks are read-only checks for a dry run; a real deploy
-        // never runs them, so the phase is dropped here.
-        let Self {
-            preflight: _,
-            pre,
-            steps,
-            post,
-            on_error,
-            finally,
-        } = self;
+        // Preflight checks are read-only checks for a dry run; a real deploy
+        // never runs them.
+        let mut entries: Vec<(Phase, Handler)> = self
+            .entries
+            .into_iter()
+            .filter(|(phase, _)| *phase != Phase::Preflight)
+            .collect();
+        entries.sort_by_key(|(phase, _)| phase_rank(*phase));
+
         let mut failures = Vec::new();
-
-        run_hook_phase("pre", pre, context, &mut report, &mut failures);
-        let mut failed = !failures.is_empty();
-
-        if !failed {
-            for step in steps {
-                match step.run(context, reporter) {
-                    Ok(step_report) => report.steps.push(step_report),
-                    Err(error) => {
+        let mut failed = false;
+        let mut current: Option<Phase> = None;
+        let mut skip_phase = false;
+        for (phase, mut handler) in entries {
+            if current != Some(phase) {
+                if let Some(previous) = current
+                    && !failed
+                {
+                    state.mark_phase_done(previous);
+                }
+                current = Some(phase);
+                skip_phase = !phase_runs(phase, failed);
+            }
+            if skip_phase {
+                continue;
+            }
+            let is_step = handler.is_step();
+            let label = handler.name().to_owned();
+            match run_entry(
+                phase,
+                &mut handler,
+                context,
+                reporter,
+                &mut report,
+                &mut state,
+            ) {
+                Ok(()) => {}
+                Err(error) => {
+                    failed = true;
+                    if is_step {
+                        // A failing step stops the rest of its phase: the
+                        // rotation of a failed deploy must not run.
+                        skip_phase = true;
+                        let event = DeployEventReport::failed(phase, label.clone(), &error);
+                        reporter.handler_finished(&event);
+                        report.events.push(event);
                         failures.push(error);
-                        failed = true;
-                        break;
+                    } else {
+                        let error = error.context(format!("{label} failed"));
+                        let event = DeployEventReport::failed(phase, label.clone(), &error);
+                        reporter.handler_finished(&event);
+                        report.events.push(event);
+
+                        failures.push(error);
                     }
                 }
             }
         }
-
-        if !failed {
-            run_hook_phase("post", post, context, &mut report, &mut failures);
-            failed = !failures.is_empty();
+        if let Some(last) = current
+            && !failed
+        {
+            state.mark_phase_done(last);
         }
-
-        if failed {
-            run_hook_phase("on_error", on_error, context, &mut report, &mut failures);
-        }
-        run_hook_phase("finally", finally, context, &mut report, &mut failures);
 
         let mut failures = failures.into_iter();
         if let Some(mut aggregated) = failures.next() {
@@ -328,27 +252,132 @@ impl DeployPlan {
             }
             return Err(aggregated);
         }
-        Ok(report)
+        Ok((report, state))
     }
 }
 
-/// The error of a dry run whose preflight hooks failed.
+impl Default for DeployPlan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Where `phase` sits in the execution order. `Preflight` is not part of it (a
+/// real deploy filters it out) and sorts last.
+fn phase_rank(phase: Phase) -> usize {
+    Phase::ORDER
+        .iter()
+        .position(|candidate| *candidate == phase)
+        .unwrap_or(usize::MAX)
+}
+
+/// Whether `phase` still runs, given whether the run failed so far.
+fn phase_runs(phase: Phase, failed: bool) -> bool {
+    if phase.is_failure_only() {
+        failed
+    } else {
+        !failed || phase.is_always()
+    }
+}
+
+/// Run one entry.
+///
+/// A built-in step reports a [`DeployStepReport`] through
+/// [`DeployReport::steps`]; a handler at a slot phase reports there too, and a
+/// handler at a lifecycle phase reports through [`DeployReport::hooks`]. Lines a
+/// handler recorded with [`RunState::note`] go to the reporter.
+fn run_entry(
+    phase: Phase,
+    handler: &mut Handler,
+    context: &DeployContext,
+    reporter: &mut dyn Reporter,
+    report: &mut DeployReport,
+    state: &mut RunState,
+) -> Result<()> {
+    let name = handler.name().to_owned();
+    let description = handler.render(phase, context);
+    reporter.handler_started(phase, &name, &description);
+    let slot = phase.is_slot();
+    // A built-in step reports its own start and finish (0.1.0 behaviour); a
+    // closure handler is reported here.
+    let self_reporting = handler.is_step();
+    if slot && !self_reporting {
+        reporter.step_started(&name, &description);
+    }
+    let started = Instant::now();
+    let notes_before = state.notes().len();
+    let warnings_before = state.warnings().len();
+    let outcome = handler.call(context, state, reporter)?;
+    let notes: Vec<String> = state.notes()[notes_before..].to_vec();
+    for note in notes {
+        reporter.note(&note);
+    }
+    let warnings: Vec<String> = state.warnings()[warnings_before..].to_vec();
+    for warning in warnings {
+        reporter.warning(&warning);
+    }
+    if phase == Phase::Rotate {
+        state.mark_rotation(!outcome.is_skipped());
+    }
+    let step_report = DeployStepReport {
+        name: name.clone(),
+        status: if outcome.is_skipped() {
+            StepStatus::Skipped
+        } else {
+            StepStatus::Success
+        },
+        detail: outcome.detail().map(str::to_owned),
+        duration: Some(started.elapsed()),
+        exit_code: outcome.exit_code(),
+        artifacts: outcome.artifacts().to_vec(),
+    };
+    let event = DeployEventReport::from_step_report(phase, &step_report);
+    reporter.handler_finished(&event);
+    report.events.push(event);
+    if slot && !self_reporting {
+        reporter.step_finished(&step_report);
+    }
+    Ok(())
+}
+
+/// Run one preflight check: a failure is collected and reported, not
+/// propagated, so the error can list every check that ran.
+fn run_check(
+    phase: Phase,
+    handler: &mut Handler,
+    context: &DeployContext,
+    reporter: &mut dyn Reporter,
+    report: &mut DeployReport,
+    state: &mut RunState,
+    failures: &mut Vec<anyhow::Error>,
+) {
+    let label = handler.name().to_owned();
+    if let Err(error) = run_entry(phase, handler, context, reporter, report, state) {
+        let error = error.context(format!("{label} failed"));
+        let event = DeployEventReport::failed(phase, label.clone(), &error);
+        reporter.handler_finished(&event);
+        report.events.push(event);
+        failures.push(error);
+    }
+}
+
+/// The error of a dry run whose preflight checks failed.
 ///
 /// The failing hooks keep their cause chain and the message lists every check
 /// that ran, plus the plan that was rendered instead of executed; the caller
 /// gets the reason and the "what would have happened" in one error.
 fn preflight_failure(
     failures: Vec<anyhow::Error>,
-    hooks: &[DeployHookReport],
+    events: &[DeployEventReport],
     plan: &[String],
 ) -> anyhow::Error {
-    let checked = hooks
+    let checked = events
         .iter()
-        .map(|hook| {
-            if hook.succeeded {
-                format!("{} (ok)", hook.name)
+        .map(|event| {
+            if event.error.is_none() {
+                format!("{} (ok)", event.name)
             } else {
-                format!("{} (failed)", hook.name)
+                format!("{} (failed)", event.name)
             }
         })
         .collect::<Vec<_>>()
@@ -368,62 +397,6 @@ fn preflight_failure(
     error.context(format!(
         "dry run: preflight failed, no deploy step was executed; checked: {checked}; planned: {planned}"
     ))
-}
-
-fn run_hook_phase(
-    phase: &str,
-    hooks: Vec<DeployHookEntry>,
-    context: &DeployContext,
-    report: &mut DeployReport,
-    failures: &mut Vec<anyhow::Error>,
-) {
-    for (index, mut entry) in hooks.into_iter().enumerate() {
-        let label = entry.label(phase, index);
-        match (entry.hook)(context) {
-            Ok(()) => report.hooks.push(DeployHookReport {
-                name: label,
-                succeeded: true,
-                error: None,
-            }),
-            Err(error) => {
-                let error = error.context(format!("{label} failed"));
-                report.hooks.push(DeployHookReport {
-                    name: label,
-                    succeeded: false,
-                    error: Some(format!("{error:#}")),
-                });
-                failures.push(error);
-            }
-        }
-    }
-}
-
-impl Default for DeployPlan {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Append one plan line per hook in `hooks`, labelled with its phase.
-fn push_hook_plan_lines(lines: &mut Vec<String>, phase: &str, hooks: &[DeployHookEntry]) {
-    lines.extend(
-        hooks
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| hook_plan_line(phase, index, entry)),
-    );
-}
-
-/// One plan line for a hook: `<phase>: <name>` for a named hook, and the
-/// `<phase> hook #<n>` label used in errors and reports for an unnamed one.
-///
-/// The phase prefix is what makes a plan line self-explanatory; errors and
-/// reports keep the bare label.
-fn hook_plan_line(phase: &str, index: usize, entry: &DeployHookEntry) -> String {
-    match &entry.name {
-        Some(name) => format!("{phase}: {name}"),
-        None => entry.label(phase, index),
-    }
 }
 
 /// Builder returned by [`deploy`].
@@ -453,8 +426,6 @@ pub struct DeployBuilder<'a> {
     idempotent_skip: Option<bool>,
     verify_install: Option<bool>,
     write_deploy_stamp: Option<bool>,
-    insert_after_build: Vec<DeployStep>,
-    insert_before_rotate: Vec<DeployStep>,
     reporter: Option<Box<dyn Reporter>>,
 }
 
@@ -467,8 +438,6 @@ impl<'a> DeployBuilder<'a> {
             idempotent_skip: None,
             verify_install: None,
             write_deploy_stamp: None,
-            insert_after_build: Vec::new(),
-            insert_before_rotate: Vec::new(),
             reporter: None,
         }
     }
@@ -481,6 +450,47 @@ impl<'a> DeployBuilder<'a> {
     /// structured events implements [`Reporter`].
     pub fn reporter(mut self, reporter: impl Reporter + 'static) -> Self {
         self.reporter = Some(Box::new(reporter));
+        self
+    }
+
+    /// Register `handler` at `phase` - the 0.4 way to add work at a point on the
+    /// timeline. Several handlers at one phase run in registration order.
+    ///
+    /// The slots are `Build`, `AfterBuild`, `Rotate`, and `AfterRotate`; the
+    /// lifecycle phases are `Preflight` (dry run only), `Pre`, `Post`,
+    /// `OnError`, and `Finally`. A handler that reports [`Outcome::Skipped`] is
+    /// recorded as such and does not stop the plan.
+    pub fn on(mut self, phase: Phase, handler: impl Into<Handler>) -> Self {
+        self.plan.push(phase, handler);
+        self
+    }
+
+    /// Register `handler` at the phase it asks for with [`Handler::at`].
+    ///
+    /// # Panics
+    ///
+    /// A handler without a default phase has no place to run; register it with
+    /// [`on`](Self::on) instead.
+    pub fn insert(mut self, handler: impl Into<Handler>) -> Self {
+        let handler = handler.into();
+        let phase = handler.default_phase().unwrap_or_else(|| {
+            panic!(
+                "handler '{}' has no default phase; register it with on(Phase::…, handler)",
+                handler.name()
+            )
+        });
+        self.plan.push(phase, handler);
+        self
+    }
+
+    /// Turn the default build + rotation plan on or off.
+    ///
+    /// This is the 0.4 name of [`without_defaults`](Self::without_defaults): the
+    /// default plan is the [`CargoBuildStep`] at [`Phase::Build`] and the
+    /// [`RotateStep`] at [`Phase::Rotate`], registered before everything the
+    /// caller added.
+    pub fn defaults(mut self, enabled: bool) -> Self {
+        self.defaults = enabled;
         self
     }
 
@@ -498,7 +508,7 @@ impl<'a> DeployBuilder<'a> {
     where
         F: FnMut(&DeployContext) -> Result<()> + 'static,
     {
-        self.preflight_named_entry(None, Box::new(hook))
+        self.preflight_named_entry(None, hook)
     }
 
     /// Add a named preflight hook; the name is used in errors and reports.
@@ -506,11 +516,15 @@ impl<'a> DeployBuilder<'a> {
     where
         F: FnMut(&DeployContext) -> Result<()> + 'static,
     {
-        self.preflight_named_entry(Some(name.into()), Box::new(hook))
+        self.preflight_named_entry(Some(name.into()), hook)
     }
 
-    fn preflight_named_entry(mut self, name: Option<String>, hook: DeployHook) -> Self {
-        self.plan.preflight.push(DeployHookEntry::new(name, hook));
+    fn preflight_named_entry<F>(mut self, name: Option<String>, hook: F) -> Self
+    where
+        F: FnMut(&DeployContext) -> Result<()> + 'static,
+    {
+        let handler = self.legacy_handler(Phase::Preflight, name, hook);
+        self.plan.push(Phase::Preflight, handler);
         self
     }
 
@@ -520,7 +534,7 @@ impl<'a> DeployBuilder<'a> {
     where
         F: FnMut(&DeployContext) -> Result<()> + 'static,
     {
-        self.pre_named_entry(None, Box::new(hook))
+        self.pre_named_entry(None, hook)
     }
 
     /// Add a named pre hook; the name is used in errors and reports.
@@ -528,11 +542,15 @@ impl<'a> DeployBuilder<'a> {
     where
         F: FnMut(&DeployContext) -> Result<()> + 'static,
     {
-        self.pre_named_entry(Some(name.into()), Box::new(hook))
+        self.pre_named_entry(Some(name.into()), hook)
     }
 
-    fn pre_named_entry(mut self, name: Option<String>, hook: DeployHook) -> Self {
-        self.plan.pre.push(DeployHookEntry::new(name, hook));
+    fn pre_named_entry<F>(mut self, name: Option<String>, hook: F) -> Self
+    where
+        F: FnMut(&DeployContext) -> Result<()> + 'static,
+    {
+        let handler = self.legacy_handler(Phase::Pre, name, hook);
+        self.plan.push(Phase::Pre, handler);
         self
     }
 
@@ -542,7 +560,7 @@ impl<'a> DeployBuilder<'a> {
     where
         F: FnMut(&DeployContext) -> Result<()> + 'static,
     {
-        self.post_named_entry(None, Box::new(hook))
+        self.post_named_entry(None, hook)
     }
 
     /// Add a named post hook; the name is used in errors and reports.
@@ -550,11 +568,15 @@ impl<'a> DeployBuilder<'a> {
     where
         F: FnMut(&DeployContext) -> Result<()> + 'static,
     {
-        self.post_named_entry(Some(name.into()), Box::new(hook))
+        self.post_named_entry(Some(name.into()), hook)
     }
 
-    fn post_named_entry(mut self, name: Option<String>, hook: DeployHook) -> Self {
-        self.plan.post.push(DeployHookEntry::new(name, hook));
+    fn post_named_entry<F>(mut self, name: Option<String>, hook: F) -> Self
+    where
+        F: FnMut(&DeployContext) -> Result<()> + 'static,
+    {
+        let handler = self.legacy_handler(Phase::Post, name, hook);
+        self.plan.push(Phase::Post, handler);
         self
     }
 
@@ -565,7 +587,7 @@ impl<'a> DeployBuilder<'a> {
     where
         F: FnMut(&DeployContext) -> Result<()> + 'static,
     {
-        self.on_error_named_entry(None, Box::new(hook))
+        self.on_error_named_entry(None, hook)
     }
 
     /// Add a named `on_error` hook; the name is used in errors and reports.
@@ -573,11 +595,15 @@ impl<'a> DeployBuilder<'a> {
     where
         F: FnMut(&DeployContext) -> Result<()> + 'static,
     {
-        self.on_error_named_entry(Some(name.into()), Box::new(hook))
+        self.on_error_named_entry(Some(name.into()), hook)
     }
 
-    fn on_error_named_entry(mut self, name: Option<String>, hook: DeployHook) -> Self {
-        self.plan.on_error.push(DeployHookEntry::new(name, hook));
+    fn on_error_named_entry<F>(mut self, name: Option<String>, hook: F) -> Self
+    where
+        F: FnMut(&DeployContext) -> Result<()> + 'static,
+    {
+        let handler = self.legacy_handler(Phase::OnError, name, hook);
+        self.plan.push(Phase::OnError, handler);
         self
     }
 
@@ -588,7 +614,7 @@ impl<'a> DeployBuilder<'a> {
     where
         F: FnMut(&DeployContext) -> Result<()> + 'static,
     {
-        self.finally_named_entry(None, Box::new(hook))
+        self.finally_named_entry(None, hook)
     }
 
     /// Add a named `finally` hook; the name is used in errors and reports.
@@ -596,45 +622,74 @@ impl<'a> DeployBuilder<'a> {
     where
         F: FnMut(&DeployContext) -> Result<()> + 'static,
     {
-        self.finally_named_entry(Some(name.into()), Box::new(hook))
+        self.finally_named_entry(Some(name.into()), hook)
     }
 
-    fn finally_named_entry(mut self, name: Option<String>, hook: DeployHook) -> Self {
-        self.plan.finally.push(DeployHookEntry::new(name, hook));
+    fn finally_named_entry<F>(mut self, name: Option<String>, hook: F) -> Self
+    where
+        F: FnMut(&DeployContext) -> Result<()> + 'static,
+    {
+        let handler = self.legacy_handler(Phase::Finally, name, hook);
+        self.plan.push(Phase::Finally, handler);
         self
     }
 
-    /// Append a custom step after the defaults (or as the only step when
-    /// [`without_defaults`](Self::without_defaults) is used).
+    /// Wrap a 0.3 hook as a 0.4 handler.
+    ///
+    /// The reported name and the rendered plan line stay exactly what 0.3
+    /// produced (`pre: stop service`, `pre hook #1`), so a migrated plan reads
+    /// the same in dry runs, errors, and reports.
+    fn legacy_handler<F>(&self, phase: Phase, name: Option<String>, hook: F) -> Handler
+    where
+        F: FnMut(&DeployContext) -> Result<()> + 'static,
+    {
+        let label = legacy_label(phase);
+        match name {
+            Some(name) => Handler::new(name.clone(), hook).plan_line(format!("{label}: {name}")),
+            None => {
+                let index = self.plan.handlers(phase).count() + 1;
+                let label = format!("{label} hook #{index}");
+                Handler::new(label.clone(), hook).plan_line(label)
+            }
+        }
+    }
+
+    /// Append a step to the caller-owned part of the plan.
+    ///
+    /// The phase follows the plan shape: with the default plan the step lands
+    /// at [`Phase::AfterRotate`] (0.3 appended it after the default rotation); in
+    /// a caller-owned plan it is placed by kind ([`CargoBuildStep`] at
+    /// [`Phase::Build`], [`RotateStep`] at [`Phase::Rotate`], everything else at
+    /// [`Phase::AfterRotate`]), which keeps the order 0.3 executed.
     pub fn step(mut self, step: DeployStep) -> Self {
-        self.plan.steps.push(step);
+        let phase = if self.defaults {
+            Phase::AfterRotate
+        } else {
+            step_phase(&step)
+        };
+        self.plan.push_step(phase, step);
         self
     }
 
-    /// Insert a step between the default cargo build and the default rotation.
+    /// Insert a step at [`Phase::AfterBuild`]: after the build and before the
+    /// rotation, the point where a service is stopped.
     ///
     /// The classic use case is `build -> stop service -> rotate -> start
     /// service`: stopping a service in a `pre` hook would stop it before the
     /// build, so a failed build keeps the service down unnecessarily.
     ///
-    /// Inserted steps shape the default plan only: after
-    /// [`without_defaults`](Self::without_defaults) the insertion is ignored and
-    /// [`step`](Self::step) is the way to add a step to a caller-owned plan.
+    /// Unlike 0.3 the insertion applies to a caller-owned plan too
+    /// ([`defaults(false)`](Self::defaults)): the slot is part of the timeline,
+    /// not part of the default plan.
     pub fn insert_after_default_build(mut self, step: DeployStep) -> Self {
-        self.insert_after_build.push(step);
+        self.plan.push_step(Phase::AfterBuild, step);
         self
     }
 
-    /// Insert a step between the default cargo build and the default rotation.
-    ///
-    /// Steps inserted here run in the order they were added. When several
-    /// steps are inserted with both methods, all
-    /// [`insert_after_default_build`](Self::insert_after_default_build) steps
-    /// run first. Like [`insert_after_default_build`](Self::insert_after_default_build),
-    /// this only shapes the default plan.
-    pub fn insert_before_default_rotate(mut self, step: DeployStep) -> Self {
-        self.insert_before_rotate.push(step);
-        self
+    /// The other name of the [`Phase::AfterBuild`] slot; steps registered with
+    /// either method run in call order.
+    pub fn insert_before_default_rotate(self, step: DeployStep) -> Self {
+        self.insert_after_default_build(step)
     }
 
     /// Replace the default cargo-build + rotate plan with exactly the steps
@@ -657,9 +712,9 @@ impl<'a> DeployBuilder<'a> {
     ///
     /// ```ignore
     /// deploy(&context)
-    ///     .without_defaults()
+    ///     .defaults(false)
     ///     .idempotent_skip(true)
-    ///     .step(DeployStep::CargoBuild(CargoBuildStep::from_context(&context)))
+    ///     .insert(CargoBuildStep::from_context(&context).at(Phase::Build))
     ///     .run()?;
     /// ```
     ///
@@ -702,22 +757,34 @@ impl<'a> DeployBuilder<'a> {
     }
 
     pub fn run(mut self) -> Result<DeployReport> {
-        let mut rotate_index = None;
+        let skip_when_unchanged = self.idempotent_skip.unwrap_or(false);
+        let verify_after_rotate = self.verify_install.unwrap_or(self.defaults);
+        let stamp_after_rotate = self.write_deploy_stamp.unwrap_or(self.defaults);
+        // The default plan and the two post-rotation steps are entries on the
+        // timeline, registered before everything the caller added: the install
+        // verification and the stamp run at `AfterRotate`, right after the
+        // rotation.
+        let mut entries: Vec<(Phase, Handler)> = Vec::new();
         if self.defaults {
             let mut steps = DeployPlan::standard(self.context);
             let rotate = steps
                 .pop()
                 .expect("the standard plan always contains a rotation step");
-            steps.append(&mut self.insert_after_build);
-            steps.append(&mut self.insert_before_rotate);
-            rotate_index = Some(steps.len());
-            steps.push(rotate);
-            steps.append(&mut self.plan.steps);
-            self.plan.steps = steps;
+            let build = steps
+                .pop()
+                .expect("the standard plan always contains a build step");
+            entries.push((Phase::Build, build.into()));
+            entries.push((Phase::Rotate, rotate.into()));
         }
-        let skip_when_unchanged = self.idempotent_skip.unwrap_or(false);
-        let verify_after_rotate = self.verify_install.unwrap_or(self.defaults);
-        let stamp_after_rotate = self.write_deploy_stamp.unwrap_or(self.defaults);
+        if verify_after_rotate {
+            entries.push((Phase::AfterRotate, verify_install_handler()));
+        }
+        if stamp_after_rotate {
+            entries.push((Phase::AfterRotate, write_stamp_handler()));
+        }
+        if !entries.is_empty() {
+            self.plan.prepend(entries);
+        }
         let context = self.context;
         let mut reporter: Box<dyn Reporter> = self
             .reporter
@@ -746,31 +813,32 @@ impl<'a> DeployBuilder<'a> {
             ));
             return Ok(report);
         }
-        let report = self.plan.run_with(context, reporter.as_mut())?;
-        // A rotation that found the installed binary already current installed
-        // nothing: there is nothing to verify and nothing new to stamp.
-        let rotation_skipped = rotate_index.is_some_and(|index| {
-            report
-                .steps
-                .get(index)
-                .is_some_and(|step| step.status == StepStatus::Skipped)
-        });
-        if !context.dry_run && verify_after_rotate && !rotation_skipped {
-            verify_installed_binary(context)?;
-        }
-        if !context.dry_run
-            && stamp_after_rotate
-            && !rotation_skipped
-            && let Err(error) = write_deploy_stamp(context)
-        {
-            reporter.warning(&format!(
-                "deployed, but the deployment stamp was not written: {error:#}"
-            ));
-        }
+        // The verification and the stamp are entries on the timeline, so a
+        // rotation that found the install current skips them the same way every
+        // other entry does (`Outcome::Skipped`), and a caller-owned plan gets
+        // them too.
+        let (report, _state) = self.plan.run_with_state(context, reporter.as_mut())?;
         Ok(report)
     }
 }
 
+/// The phase label 0.3 used in plans, errors, and reports (`on_error`, not
+/// `on-error`), so a migrated plan reads the same as before.
+fn legacy_label(phase: Phase) -> &'static str {
+    match phase {
+        Phase::OnError => "on_error",
+        other => other.label(),
+    }
+}
+
+/// The slot a built-in step belongs to in a caller-owned plan.
+fn step_phase(step: &DeployStep) -> Phase {
+    match step {
+        DeployStep::CargoBuild(_) => Phase::Build,
+        DeployStep::Rotate(_) => Phase::Rotate,
+        _ => Phase::AfterRotate,
+    }
+}
 /// Idempotent short-circuit: skip the whole plan when the deployment stamp
 /// proves that nothing changed.
 ///
@@ -822,16 +890,19 @@ fn skip_current_report(context: &DeployContext) -> Result<Option<DeployReport>> 
         installed: destination.clone(),
         dry_run: false,
         plan: Vec::new(),
-        steps: vec![
-            DeployStepReport {
+        events: vec![
+            DeployEventReport {
+                phase: Phase::Build,
                 name: "cargo build".to_owned(),
                 status: StepStatus::Skipped,
                 detail: Some("build inputs are unchanged since the last deploy".to_owned()),
                 duration: None,
                 exit_code: None,
                 artifacts: Vec::new(),
+                error: None,
             },
-            DeployStepReport {
+            DeployEventReport {
+                phase: Phase::Rotate,
                 name: "rotate".to_owned(),
                 status: StepStatus::Skipped,
                 detail: Some(format!(
@@ -841,9 +912,9 @@ fn skip_current_report(context: &DeployContext) -> Result<Option<DeployReport>> 
                 duration: None,
                 exit_code: None,
                 artifacts: Vec::new(),
+                error: None,
             },
         ],
-        hooks: Vec::new(),
     }))
 }
 
@@ -892,6 +963,50 @@ fn deploy_stamp_path(context: &DeployContext) -> PathBuf {
     context
         .state_dir
         .join(format!("{}.stamp", context.binary_name))
+}
+
+/// The `AfterRotate` entry that verifies the installed binary.
+///
+/// A rotation that found the install current installed nothing, so there is
+/// nothing to verify: the entry skips, exactly like a hand-written handler
+/// would.
+fn verify_install_handler() -> Handler {
+    Handler::with_state("verify install", |context, state| {
+        // A rotation that found the install current installed nothing, so there
+        // is nothing to verify (0.3 skipped the verification there too). A plan
+        // without a rotation installs through its own steps, so this still runs.
+        if state.rotation() == Some(false) {
+            return Ok(Outcome::skipped(
+                "the rotation found the installed binary already current",
+            ));
+        }
+        verify_installed_binary(context)?;
+        Ok(Outcome::Done {
+            detail: Some(format!("verified {}", context.install_path.display())),
+            artifacts: Vec::new(),
+            exit_code: None,
+        })
+    })
+}
+
+/// The `AfterRotate` entry that writes the deployment stamp.
+///
+/// A failure to write the stamp only warns: the deploy itself succeeded, and
+/// the stamp keeps describing the last real install until the next one.
+fn write_stamp_handler() -> Handler {
+    Handler::with_state("write deploy stamp", |context, state| {
+        if state.rotation() == Some(false) {
+            return Ok(Outcome::skipped(
+                "the rotation found the installed binary already current",
+            ));
+        }
+        if let Err(error) = write_deploy_stamp(context) {
+            state.warn(format!(
+                "deployed, but the deployment stamp was not written: {error:#}"
+            ));
+        }
+        Ok(Outcome::default())
+    })
 }
 
 /// Fields of a deployment stamp. A field is `None` when the stamp does not
@@ -998,715 +1113,6 @@ pub fn deploy(context: &DeployContext) -> DeployBuilder<'_> {
     DeployBuilder::new(context)
 }
 
-pub enum DeployStep {
-    /// Run `cargo build -p <package>` in the workspace.
-    CargoBuild(CargoBuildStep),
-    /// Replace the installed binary, possibly while it is running.
-    Rotate(RotateStep),
-    /// Run a command. Useful for service stop/start steps.
-    Run(RunStep),
-    /// Arbitrary project-specific logic.
-    Custom(DeployHook),
-}
-
-impl DeployStep {
-    /// Single-line description of the work this step would do.
-    pub fn describe(&self, context: &DeployContext) -> String {
-        match self {
-            Self::CargoBuild(step) => step.command_line(context).join(" "),
-            Self::Rotate(step) => step.description(),
-            Self::Run(step) => step.description(),
-            Self::Custom(_) => "custom step (opaque)".to_owned(),
-        }
-    }
-
-    /// The name this step reports itself under.
-    fn name(&self) -> String {
-        match self {
-            Self::CargoBuild(_) => "cargo build".to_owned(),
-            Self::Rotate(_) => "rotate".to_owned(),
-            Self::Run(step) => format!("run {}", step.program.display()),
-            Self::Custom(_) => "custom".to_owned(),
-        }
-    }
-
-    fn run(self, context: &DeployContext, reporter: &mut dyn Reporter) -> Result<DeployStepReport> {
-        let name = self.name();
-        reporter.step_started(&name, &self.describe(context));
-        let started = Instant::now();
-        let mut report = self.run_inner(context, reporter)?;
-        report.duration = Some(started.elapsed());
-        reporter.step_finished(&report);
-        Ok(report)
-    }
-
-    fn run_inner(
-        self,
-        context: &DeployContext,
-        reporter: &mut dyn Reporter,
-    ) -> Result<DeployStepReport> {
-        match self {
-            Self::CargoBuild(step) => step.run(context, reporter),
-            Self::Rotate(step) => step.run(context, reporter),
-            Self::Run(step) => step.run(context, reporter),
-            Self::Custom(mut step) => {
-                step(context).with_context(|| "step 'custom' failed")?;
-                Ok(DeployStepReport {
-                    name: "custom".to_owned(),
-                    status: StepStatus::Success,
-                    detail: None,
-                    duration: None,
-                    exit_code: None,
-                    artifacts: Vec::new(),
-                })
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CargoBuildStep {
-    pub package: String,
-    pub release: bool,
-    pub cargo: Option<PathBuf>,
-    pub profile: Option<String>,
-    pub locked: bool,
-    pub target: Option<String>,
-    pub target_dir: Option<PathBuf>,
-    pub features: Vec<String>,
-    pub no_default_features: bool,
-    pub extra_args: Vec<String>,
-}
-
-impl CargoBuildStep {
-    pub fn from_context(context: &DeployContext) -> Self {
-        Self {
-            package: context.package.clone(),
-            release: context.release,
-            cargo: context.cargo.clone(),
-            profile: context.profile_name.clone(),
-            locked: context.locked,
-            target: context.target.clone(),
-            target_dir: context.target_dir.clone(),
-            features: context.features.clone(),
-            no_default_features: context.no_default_features,
-            extra_args: context.build_args.clone(),
-        }
-    }
-
-    /// Full command line (program first) used for building. Execution, dry-run
-    /// rendering, and error messages all share this source.
-    pub fn command_line(&self, _context: &DeployContext) -> Vec<String> {
-        let program = self
-            .cargo
-            .clone()
-            .or_else(|| std::env::var_os("CARGO").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("cargo"));
-        let mut line = vec![
-            program.display().to_string(),
-            "build".to_owned(),
-            "-p".to_owned(),
-            self.package.clone(),
-            "--color".to_owned(),
-            "always".to_owned(),
-        ];
-        match (&self.profile, self.release) {
-            (Some(profile), _) => {
-                line.push("--profile".to_owned());
-                line.push(profile.clone());
-            }
-            (None, true) => line.push("--release".to_owned()),
-            (None, false) => {}
-        }
-        if self.locked {
-            line.push("--locked".to_owned());
-        }
-        if let Some(target) = &self.target {
-            line.push("--target".to_owned());
-            line.push(target.clone());
-        }
-        if let Some(target_dir) = &self.target_dir {
-            line.push("--target-dir".to_owned());
-            line.push(target_dir.display().to_string());
-        }
-        if !self.features.is_empty() {
-            line.push("--features".to_owned());
-            line.push(self.features.join(","));
-        }
-        if self.no_default_features {
-            line.push("--no-default-features".to_owned());
-        }
-        line.extend(self.extra_args.iter().cloned());
-        line
-    }
-
-    fn run(self, context: &DeployContext, reporter: &mut dyn Reporter) -> Result<DeployStepReport> {
-        let line = self.command_line(context);
-        let command = line.join(" ");
-        reporter.note(&command);
-        let status = Command::new(&line[0])
-            .current_dir(&context.workspace_root)
-            .args(&line[1..])
-            .status()
-            .with_context(|| {
-                format!(
-                    "step 'cargo build' (package {}) failed in {}: could not run `{command}`",
-                    self.package,
-                    context.workspace_root.display()
-                )
-            })?;
-        if !status.success() {
-            anyhow::bail!(
-                "step 'cargo build' (package {}) failed in {} with {status} (command: `{command}`)",
-                self.package,
-                context.workspace_root.display()
-            );
-        }
-        Ok(DeployStepReport {
-            name: "cargo build".to_owned(),
-            status: StepStatus::Success,
-            detail: Some(self.package),
-            duration: None,
-            exit_code: status.code(),
-            artifacts: vec![context.built_binary_path()],
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RotateStep {
-    pub source: PathBuf,
-    pub destination: PathBuf,
-    pub backup_dir: Option<PathBuf>,
-    pub strategy: RotateStrategy,
-    pub backup_retention: Option<usize>,
-    pub backup_max_age: Option<std::time::Duration>,
-}
-
-impl RotateStep {
-    pub fn from_context(context: &DeployContext) -> Self {
-        Self {
-            source: context.built_binary_path(),
-            destination: context.install_path.clone(),
-            backup_dir: context.backup_dir.clone(),
-            strategy: RotateStrategy::Auto,
-            backup_retention: context.backup_retention,
-            backup_max_age: context.backup_max_age,
-        }
-    }
-
-    /// Single-line description of the rotation this step would perform.
-    pub fn description(&self) -> String {
-        let mut line = format!(
-            "rotate {} -> {}",
-            self.source.display(),
-            self.destination.display()
-        );
-        if let Some(dir) = &self.backup_dir {
-            line.push_str(&format!(" (backup dir: {})", dir.display()));
-        }
-        // Record the strategy (including the Windows degradation of `Atomic`)
-        // so a dry-run plan never promises a guarantee the platform cannot
-        // deliver.
-        line.push_str(&format!(" (strategy: {}", self.strategy.label()));
-        #[cfg(windows)]
-        if self.strategy == RotateStrategy::Atomic {
-            line.push_str(" -> rename-aside on Windows");
-        }
-        line.push(')');
-        line
-    }
-
-    fn run(
-        self,
-        context: &DeployContext,
-        _reporter: &mut dyn Reporter,
-    ) -> Result<DeployStepReport> {
-        let description = self.description();
-        // Cargo already answered "is the build output stale?"; this answers the
-        // second question - "is the installed binary that output?". Identical
-        // bytes mean the install is current: nothing is copied, no backup is
-        // created, and a running binary is left alone (on Windows the Windows
-        // rotation would otherwise rename it aside on every run).
-        if !context.dry_run
-            && !context.force
-            && self.source.is_file()
-            && self.destination.is_file()
-            && content_matches(&self.source, &self.destination).unwrap_or(false)
-        {
-            return Ok(DeployStepReport {
-                name: "rotate".to_owned(),
-                status: StepStatus::Skipped,
-                detail: Some(format!(
-                    "{} is already the built binary",
-                    self.destination.display()
-                )),
-                duration: None,
-                exit_code: None,
-                artifacts: Vec::new(),
-            });
-        }
-        let outcome = rotate(&RotateOptions {
-            source: self.source,
-            destination: self.destination,
-            backup_dir: self.backup_dir,
-            strategy: self.strategy,
-            backup_retention: self.backup_retention,
-            backup_max_age: self.backup_max_age,
-            dry_run: context.dry_run,
-            // The deferred-cleanup policy belongs to the rotation ticket;
-            // `None` keeps the best-effort cleanup `RotateStep` always had.
-            backup_cleanup_retry: None,
-        })
-        .with_context(|| format!("step 'rotate' failed: {description}"))?;
-        // The rotation prints nothing (0.1.0 behaviour); what it produced is
-        // reported through the artifacts instead.
-        let (detail, artifacts) = match &outcome {
-            RotateOutcome::WouldReplace { destination } => (
-                format!("would replace {}", destination.display()),
-                Vec::new(),
-            ),
-            RotateOutcome::Replaced { destination } => (
-                format!("replaced {}", destination.display()),
-                vec![destination.clone()],
-            ),
-            RotateOutcome::ReplacedAfterRename {
-                destination,
-                backup,
-            } => (
-                format!(
-                    "replaced {}; previous binary preserved at {}",
-                    destination.display(),
-                    backup.display()
-                ),
-                vec![destination.clone(), backup.clone()],
-            ),
-        };
-        Ok(DeployStepReport {
-            name: "rotate".to_owned(),
-            status: StepStatus::Success,
-            detail: Some(detail),
-            duration: None,
-            exit_code: None,
-            artifacts,
-        })
-    }
-}
-
-/// What a [`RunStep`] ran and what came back: the argument of the predicate
-/// attached with [`RunStep::verify`].
-#[derive(Debug, Clone)]
-pub struct RunOutcome {
-    /// The program that was spawned.
-    pub program: PathBuf,
-    /// The arguments the program was spawned with.
-    pub args: Vec<String>,
-    /// The working directory of the child; `None` means the deploy process's
-    /// own directory.
-    pub current_dir: Option<PathBuf>,
-    /// Whether the child exited zero.
-    pub success: bool,
-    /// The child's exit code; `None` when it was terminated by a signal.
-    pub exit_code: Option<i32>,
-    /// The captured stdout; empty unless [`RunStep::capture_stdout`] is set.
-    pub stdout: String,
-    /// The captured stderr; empty unless [`RunStep::capture_stderr`] is set or
-    /// [`RunStep::allow_failure`] captured it for a failure report.
-    pub stderr: String,
-}
-
-/// The predicate a [`StepVerify`] holds: shared so that a [`RunStep`] stays
-/// `Clone`.
-type VerifyPredicate = Arc<dyn Fn(&RunOutcome) -> Result<()>>;
-
-/// The predicate attached to a [`RunStep`] by [`RunStep::verify`].
-///
-/// It is kept behind an [`Arc`] so that a step stays `Clone`, and is called at
-/// most once per run. Any `Fn` is accepted: the deploy plan runs its steps on
-/// one thread, exactly like the `Custom` steps that take a
-/// `Box<dyn FnMut(&DeployContext) -> Result<()>>`.
-#[derive(Clone)]
-pub struct StepVerify(VerifyPredicate);
-
-impl StepVerify {
-    /// Wrap `verify`.
-    pub fn new<F>(verify: F) -> Self
-    where
-        F: Fn(&RunOutcome) -> Result<()> + 'static,
-    {
-        Self(Arc::new(verify))
-    }
-
-    /// Check `outcome`, returning the predicate's error unchanged.
-    pub fn call(&self, outcome: &RunOutcome) -> Result<()> {
-        (self.0)(outcome)
-    }
-}
-
-impl fmt::Debug for StepVerify {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("StepVerify(<predicate>)")
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RunStep {
-    pub program: PathBuf,
-    pub args: Vec<String>,
-    pub current_dir: Option<PathBuf>,
-    pub env: Vec<(String, String)>,
-    pub allow_failure: bool,
-    /// Capture the child's stdout into [`RunOutcome::stdout`] and the report
-    /// detail.
-    pub capture_stdout: bool,
-    /// Capture the child's stderr into [`RunOutcome::stderr`] and the report
-    /// detail; [`RunStep::allow_failure`] captures it on its own.
-    pub capture_stderr: bool,
-    /// Kill the child and fail the step when it is still running after this
-    /// long.
-    pub timeout: Option<Duration>,
-    /// Require this exit code instead of the "the child succeeded" default.
-    pub expected_status: Option<i32>,
-    /// Predicate checked once the exit status was accepted.
-    pub verify: Option<StepVerify>,
-}
-
-impl RunStep {
-    pub fn new(program: impl Into<PathBuf>) -> Self {
-        Self {
-            program: program.into(),
-            args: Vec::new(),
-            current_dir: None,
-            env: Vec::new(),
-            allow_failure: false,
-            capture_stdout: false,
-            capture_stderr: false,
-            timeout: None,
-            expected_status: None,
-            verify: None,
-        }
-    }
-
-    pub fn args<I, S>(mut self, args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.args = args.into_iter().map(Into::into).collect();
-        self
-    }
-
-    pub fn current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.current_dir = Some(dir.into());
-        self
-    }
-
-    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.env.push((key.into(), value.into()));
-        self
-    }
-
-    pub fn allow_failure(mut self, allow: bool) -> Self {
-        self.allow_failure = allow;
-        self
-    }
-
-    /// Capture the child's stdout: it reaches [`RunStep::verify`] as
-    /// [`RunOutcome::stdout`] and the step report as a tail of it.
-    pub fn capture_stdout(mut self) -> Self {
-        self.capture_stdout = true;
-        self
-    }
-
-    /// Capture the child's stderr: it reaches [`RunStep::verify`] as
-    /// [`RunOutcome::stderr`] and the step report as a tail of it.
-    pub fn capture_stderr(mut self) -> Self {
-        self.capture_stderr = true;
-        self
-    }
-
-    /// Fail the step when the child is still running after `timeout`, killing
-    /// it first ([`Child::kill`]) so the deploy cannot hang on a command that
-    /// never returns. The error names the program, its arguments, the working
-    /// directory, the timeout, and the exit status after the kill.
-    ///
-    /// A timeout fails the step even with [`RunStep::allow_failure`]: the
-    /// command did not finish, so an exit code would say nothing about it.
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
-    /// Require the child to exit with this status instead of the default "the
-    /// child must succeed". A mismatch fails the step, or - with
-    /// [`RunStep::allow_failure`] - is reported as an ignored failure.
-    pub fn expected_status(mut self, status: i32) -> Self {
-        self.expected_status = Some(status);
-        self
-    }
-
-    /// Check a predicate once the exit status was accepted. It receives the
-    /// [`RunOutcome`], including whatever [`RunStep::capture_stdout`] and
-    /// [`RunStep::capture_stderr`] captured, and fails the step when it returns
-    /// an error.
-    pub fn verify<F>(mut self, verify: F) -> Self
-    where
-        F: Fn(&RunOutcome) -> Result<()> + 'static,
-    {
-        self.verify = Some(StepVerify::new(verify));
-        self
-    }
-
-    /// Single-line description of the command this step would run.
-    pub fn description(&self) -> String {
-        let mut line = format!("run {}", self.program.display());
-        if !self.args.is_empty() {
-            line.push(' ');
-            line.push_str(&self.args.join(" "));
-        }
-        if let Some(dir) = &self.current_dir {
-            line.push_str(&format!(" (cwd: {})", dir.display()));
-        }
-        line
-    }
-
-    fn run(
-        self,
-        _context: &DeployContext,
-        reporter: &mut dyn Reporter,
-    ) -> Result<DeployStepReport> {
-        let description = self.description();
-        reporter.note(&description);
-        let mut command = Command::new(&self.program);
-        command.args(&self.args);
-        if let Some(dir) = &self.current_dir {
-            command.current_dir(dir);
-        }
-        for (key, value) in &self.env {
-            command.env(key, value);
-        }
-        // `allow_failure` needs the stderr tail for the report; the capture
-        // switches add the streams the caller asked for.
-        if self.capture_stdout {
-            command.stdout(Stdio::piped());
-        }
-        if self.capture_stderr || self.allow_failure {
-            command.stderr(Stdio::piped());
-        }
-        let mut child = command.spawn().with_context(|| {
-            format!(
-                "step '{description}' failed: could not spawn `{}`",
-                self.program.display()
-            )
-        })?;
-        // Drain the pipes while the child runs: a full pipe would block it.
-        let stdout = child.stdout.take().map(read_pipe);
-        let stderr = child.stderr.take().map(read_pipe);
-        let waited = match self.timeout {
-            Some(timeout) => wait_with_timeout(&mut child, timeout),
-            None => child
-                .wait()
-                .map(Waited::Exited)
-                .map_err(anyhow::Error::from),
-        }
-        .with_context(|| {
-            format!(
-                "step '{description}' failed: could not wait for `{}`",
-                self.program.display()
-            )
-        })?;
-        let stdout = join_pipe(stdout);
-        let stderr = join_pipe(stderr);
-        let status = match waited {
-            Waited::Exited(status) => status,
-            Waited::TimedOut(status) => {
-                let timeout = self.timeout.unwrap_or_default();
-                anyhow::bail!(
-                    "step '{description}' timed out after {timeout:?} and the child was killed ({})",
-                    exit_code_text(&status)
-                );
-            }
-        };
-        let outcome = RunOutcome {
-            program: self.program.clone(),
-            args: self.args.clone(),
-            current_dir: self.current_dir.clone(),
-            success: status.success(),
-            exit_code: status.code(),
-            stdout,
-            stderr,
-        };
-        let mismatched = match self.expected_status {
-            Some(expected) => status.code() != Some(expected),
-            None => !status.success(),
-        };
-        if mismatched && !self.allow_failure {
-            if let Some(expected) = self.expected_status {
-                anyhow::bail!(
-                    "step '{description}' failed: expected exit code {expected} but got {}",
-                    exit_code_text(&status)
-                );
-            }
-            anyhow::bail!("step '{description}' failed with {status}");
-        }
-        let mut chunks: Vec<String> = Vec::new();
-        if mismatched {
-            // An allowed failure keeps the exit code and the stderr tail.
-            let mut detail = format!("exit {status} (allowed failure)");
-            if let Some(tail) = captured_tail(&outcome.stderr) {
-                detail.push_str(&format!("; stderr tail:\n{tail}"));
-            }
-            chunks.push(detail);
-        } else if self.capture_stderr
-            && let Some(tail) = captured_tail(&outcome.stderr)
-        {
-            chunks.push(format!("stderr tail:\n{tail}"));
-        }
-        if self.capture_stdout
-            && let Some(tail) = captured_tail(&outcome.stdout)
-        {
-            chunks.push(format!("stdout tail:\n{tail}"));
-        }
-        if let Some(verify) = &self.verify {
-            verify
-                .call(&outcome)
-                .with_context(|| format!("step '{description}' failed verification"))?;
-        }
-        Ok(DeployStepReport {
-            name: format!("run {}", self.program.display()),
-            status: StepStatus::Success,
-            detail: (!chunks.is_empty()).then(|| chunks.join("\n")),
-            duration: None,
-            exit_code: outcome.exit_code,
-            artifacts: Vec::new(),
-        })
-    }
-}
-
-/// How long [`wait_with_timeout`] sleeps between two child-status polls.
-const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-/// How waiting for a child ended.
-enum Waited {
-    /// The child exited on its own.
-    Exited(ExitStatus),
-    /// The timeout expired: the child was killed and reaped, and this is its
-    /// status after the kill.
-    TimedOut(ExitStatus),
-}
-
-/// Wait for `child` for at most `timeout`, killing it when the timeout
-/// expires: a deploy must not hang on a command that never returns.
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<Waited> {
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .context("could not check whether the child process is still running")?
-        {
-            return Ok(Waited::Exited(status));
-        }
-        let elapsed = started.elapsed();
-        if elapsed >= timeout {
-            break;
-        }
-        std::thread::sleep(WAIT_POLL_INTERVAL.min(timeout - elapsed));
-    }
-    child
-        .kill()
-        .context("could not kill the child process that timed out")?;
-    let status = child
-        .wait()
-        .context("could not reap the child process that timed out")?;
-    Ok(Waited::TimedOut(status))
-}
-
-/// Read a child pipe to a string in the background, so a full pipe cannot
-/// block the child while the parent waits for it.
-fn read_pipe<R: Read + Send + 'static>(mut pipe: R) -> JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut buffer = String::new();
-        let _ = pipe.read_to_string(&mut buffer);
-        buffer
-    })
-}
-
-/// Join a pipe reader, tolerating a reader thread that did not finish.
-fn join_pipe(handle: Option<JoinHandle<String>>) -> String {
-    match handle {
-        Some(handle) => handle.join().unwrap_or_default(),
-        None => String::new(),
-    }
-}
-
-/// The exit status of a process as it appears in error messages.
-fn exit_code_text(status: &ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("exit code {code}"),
-        None => format!("no exit code ({status})"),
-    }
-}
-
-/// The tail of a captured stream, or `None` when it is empty.
-fn captured_tail(text: &str) -> Option<String> {
-    tail_lines(text, 20).filter(|tail| !tail.is_empty())
-}
-
-/// Last `count` lines of `text`, or `None` when the text is empty.
-fn tail_lines(text: &str, count: usize) -> Option<String> {
-    let lines = text.lines().collect::<Vec<_>>();
-    if lines.is_empty() {
-        return None;
-    }
-    let start = lines.len().saturating_sub(count);
-    Some(lines[start..].join("\n"))
-}
-
-#[derive(Debug, Default)]
-pub struct DeployReport {
-    pub installed: PathBuf,
-    pub dry_run: bool,
-    /// The hook and step lines that would run, in execution order; filled by
-    /// dry-run.
-    pub plan: Vec<String>,
-    pub steps: Vec<DeployStepReport>,
-    /// Hook execution results across preflight (dry run only) / pre / post /
-    /// on_error / finally.
-    pub hooks: Vec<DeployHookReport>,
-}
-
-/// Result of one executed hook.
-#[derive(Debug)]
-pub struct DeployHookReport {
-    pub name: String,
-    pub succeeded: bool,
-    pub error: Option<String>,
-}
-
-/// Completion state of a step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StepStatus {
-    #[default]
-    Success,
-    Skipped,
-}
-
-#[derive(Debug)]
-pub struct DeployStepReport {
-    pub name: String,
-    pub status: StepStatus,
-    pub detail: Option<String>,
-    /// How long the step took; `None` for a step that did not run (a skipped
-    /// one), because there is nothing to measure then.
-    pub duration: Option<Duration>,
-    /// The exit code of the process the step ran, when it ran one.
-    pub exit_code: Option<i32>,
-    /// The files the step created or replaced: the installed binary - and the
-    /// backup it was moved aside to - for `rotate`, the built binary for
-    /// `cargo build`, and nothing for a step that did not run.
-    pub artifacts: Vec<PathBuf>,
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1716,9 +1122,10 @@ mod tests {
     };
 
     use super::{
-        CargoBuildStep, DeployBuilder, DeployStep, DeployStepReport, NullReporter, Reporter,
-        RotateStep, RunStep, StdoutReporter, StepStatus, default_reporter, deploy,
-        skip_current_report, verify_installed_binary, write_deploy_stamp,
+        CargoBuildStep, DeployBuilder, DeployEventReport, DeployStep, DeployStepReport, Handler,
+        NullReporter, Outcome, Phase, Reporter, RotateStep, RunStep, StdoutReporter, StepStatus,
+        default_reporter, deploy, install_is_current, skip_current_report, verify_installed_binary,
+        write_deploy_stamp,
     };
     use crate::context::{DeployContext, build_inputs_fingerprint};
     use crate::rotate::RotateStrategy;
@@ -1813,8 +1220,8 @@ mod tests {
             "plan: {:?}",
             report.plan
         );
-        assert!(report.steps.is_empty());
-        assert!(report.hooks.is_empty());
+        assert!(report.steps().is_empty());
+        assert!(report.hooks().is_empty());
     }
 
     #[test]
@@ -1863,10 +1270,10 @@ mod tests {
             .expect("dry-run plan");
 
         assert_eq!(*events.borrow(), ["preflight"]);
-        assert_eq!(report.hooks.len(), 1);
-        assert_eq!(report.hooks[0].name, "check signature");
-        assert!(report.hooks[0].succeeded);
-        assert!(report.steps.is_empty());
+        assert_eq!(report.hooks().len(), 1);
+        assert_eq!(report.hooks()[0].name, "check signature");
+        assert!(report.hooks()[0].error.is_none());
+        assert!(report.steps().is_empty());
         assert!(report.dry_run);
         assert_eq!(
             tree(&dir),
@@ -1930,10 +1337,10 @@ mod tests {
         assert_eq!(*events.borrow(), ["step"]);
         assert!(report.plan.is_empty(), "plan: {:?}", report.plan);
         assert!(
-            report.hooks.is_empty(),
+            report.hooks().is_empty(),
             "hooks: {:?}",
             report
-                .hooks
+                .hooks()
                 .iter()
                 .map(|hook| &hook.name)
                 .collect::<Vec<_>>()
@@ -2085,10 +1492,10 @@ mod tests {
             .run()
             .expect("plan");
 
-        assert_eq!(report.hooks.len(), 1);
-        assert_eq!(report.hooks[0].name, "restart service");
-        assert!(report.hooks[0].succeeded);
-        assert!(report.hooks[0].error.is_none());
+        assert_eq!(report.hooks().len(), 1);
+        assert_eq!(report.hooks()[0].name, "restart service");
+        assert!(report.hooks()[0].error.is_none());
+        assert!(report.hooks()[0].error.is_none());
     }
 
     #[test]
@@ -2166,10 +1573,10 @@ mod tests {
             .run()
             .expect("allowed failure still succeeds");
 
-        let detail = report.steps[0].detail.clone().unwrap_or_default();
+        let detail = report.steps()[0].detail.clone().unwrap_or_default();
         assert!(detail.contains("exit"), "detail: {detail}");
         assert!(detail.contains("boom"), "detail: {detail}");
-        assert_eq!(report.steps[0].status, StepStatus::Success);
+        assert_eq!(report.steps()[0].status, StepStatus::Success);
     }
 
     #[test]
@@ -2201,9 +1608,9 @@ mod tests {
             .run()
             .expect("skipped deploy");
 
-        assert_eq!(report.steps.len(), 2);
-        assert_eq!(report.steps[0].status, StepStatus::Skipped);
-        assert_eq!(report.steps[1].status, StepStatus::Skipped);
+        assert_eq!(report.steps().len(), 2);
+        assert_eq!(report.steps()[0].status, StepStatus::Skipped);
+        assert_eq!(report.steps()[1].status, StepStatus::Skipped);
         assert_eq!(
             std::fs::read_to_string(&destination).expect("destination"),
             "same bytes"
@@ -2300,8 +1707,8 @@ mod tests {
 
         // 1. first run: cargo builds, the rotation installs, the stamp lands.
         let first = deploy(&context).run().expect("first deploy");
-        assert_eq!(first.steps[0].status, StepStatus::Success, "cargo builds");
-        assert_eq!(first.steps[1].status, StepStatus::Success, "rotated");
+        assert_eq!(first.steps()[0].status, StepStatus::Success, "cargo builds");
+        assert_eq!(first.steps()[1].status, StepStatus::Success, "rotated");
         assert!(installed.is_file(), "the binary is installed");
         let stamped = std::fs::read_to_string(&stamp).expect("stamp");
 
@@ -2309,12 +1716,12 @@ mod tests {
         //    rotation sees the installed binary is already the built one.
         let second = deploy(&context).run().expect("second deploy");
         assert_eq!(
-            second.steps[0].status,
+            second.steps()[0].status,
             StepStatus::Success,
             "the build step always runs; cargo decides"
         );
         assert_eq!(
-            second.steps[1].status,
+            second.steps()[1].status,
             StepStatus::Skipped,
             "there is nothing to install"
         );
@@ -2332,7 +1739,7 @@ mod tests {
         )
         .expect("edit");
         let third = deploy(&context).run().expect("third deploy");
-        assert_eq!(third.steps[1].status, StepStatus::Success, "replaced");
+        assert_eq!(third.steps()[1].status, StepStatus::Success, "replaced");
         assert_ne!(
             std::fs::read_to_string(&stamp).expect("stamp"),
             stamped,
@@ -2689,11 +2096,11 @@ mod tests {
         );
         assert!(
             report
-                .steps
+                .steps()
                 .iter()
                 .all(|step| step.status == StepStatus::Skipped),
             "steps: {:?}",
-            report.steps
+            report.steps()
         );
         assert_eq!(
             std::fs::read_to_string(&context.install_path).expect("installed"),
@@ -2826,6 +2233,7 @@ mod tests {
             strategy,
             backup_retention: None,
             backup_max_age: None,
+            backup_cleanup_retry: None,
         }
     }
 
@@ -2856,9 +2264,9 @@ mod tests {
             .expect("the predicate saw the outcome");
         assert!(stdout.contains("out"), "stdout: {stdout:?}");
         assert!(stderr.contains("err"), "stderr: {stderr:?}");
-        assert_eq!(report.steps[0].exit_code, Some(0));
-        assert!(report.steps[0].duration.is_some());
-        let detail = report.steps[0].detail.clone().unwrap_or_default();
+        assert_eq!(report.steps()[0].exit_code, Some(0));
+        assert!(report.steps()[0].duration.is_some());
+        let detail = report.steps()[0].detail.clone().unwrap_or_default();
         assert!(detail.contains("stdout tail"), "detail: {detail}");
         assert!(detail.contains("stderr tail"), "detail: {detail}");
     }
@@ -2962,10 +2370,10 @@ mod tests {
             .run()
             .expect("an allowed failure still succeeds");
 
-        assert_eq!(report.steps[0].status, StepStatus::Success);
-        assert_eq!(report.steps[0].exit_code, Some(3));
-        assert!(report.steps[0].duration.is_some());
-        let detail = report.steps[0].detail.clone().unwrap_or_default();
+        assert_eq!(report.steps()[0].status, StepStatus::Success);
+        assert_eq!(report.steps()[0].exit_code, Some(3));
+        assert!(report.steps()[0].duration.is_some());
+        let detail = report.steps()[0].detail.clone().unwrap_or_default();
         assert!(detail.contains("allowed failure"), "detail: {detail}");
         assert!(detail.contains("stderr tail"), "detail: {detail}");
         assert!(detail.contains("boom"), "detail: {detail}");
@@ -2992,16 +2400,16 @@ mod tests {
             .run()
             .expect("rotate step");
 
-        assert_eq!(report.steps[0].status, StepStatus::Success);
+        assert_eq!(report.steps()[0].status, StepStatus::Success);
         assert!(
-            report.steps[0].duration.is_some(),
+            report.steps()[0].duration.is_some(),
             "a step that ran reports how long it took"
         );
-        assert!(report.steps[0].exit_code.is_none());
+        assert!(report.steps()[0].exit_code.is_none());
         assert!(
-            report.steps[0].artifacts.contains(&destination),
+            report.steps()[0].artifacts.contains(&destination),
             "artifacts: {:?}",
-            report.steps[0].artifacts
+            report.steps()[0].artifacts
         );
         assert_eq!(
             std::fs::read_to_string(&destination).expect("installed"),
@@ -3032,7 +2440,7 @@ mod tests {
             .run()
             .expect("rename-aside rotation");
 
-        let artifacts = &report.steps[0].artifacts;
+        let artifacts = &report.steps()[0].artifacts;
         assert_eq!(
             artifacts.first(),
             Some(&destination),
@@ -3130,7 +2538,7 @@ mod tests {
             .run()
             .expect("run step");
 
-        assert_eq!(report.steps.len(), 1);
+        assert_eq!(report.steps().len(), 1);
         let recorded: Vec<String> = events.borrow().clone();
         for prefix in ["started: run ", "note: run ", "finished: run "] {
             assert!(
@@ -3369,7 +2777,7 @@ mod tests {
             ["build", "stop", "rotate", "start"],
             "steps: {:?}",
             report
-                .steps
+                .steps()
                 .iter()
                 .map(|step| &step.name)
                 .collect::<Vec<_>>()
@@ -3394,7 +2802,8 @@ mod tests {
 
         assert_eq!(
             *events.borrow(),
-            ["build", "stop-1", "stop-2", "pre-rotate", "rotate"]
+            ["build", "stop-1", "pre-rotate", "stop-2", "rotate"],
+            "0.4: the AfterBuild slot runs its steps in call order"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3411,21 +2820,30 @@ mod tests {
             .run()
             .expect("the default plan");
 
-        assert_eq!(report.steps.len(), 2, "steps: {:?}", report.steps);
+        assert_eq!(report.steps().len(), 2, "steps: {:?}", report.steps());
         assert_eq!(*events.borrow(), ["build", "rotate"]);
 
-        // The dry-run plan is exactly the same two lines.
+        // The dry-run plan lists the two default entries plus the two entries
+        // the default plan adds after the rotation.
         let mut dry_run = test_context();
         dry_run.dry_run = true;
         let plan = deploy(&dry_run).run().expect("dry-run plan").plan;
-        assert_eq!(plan.len(), 2, "plan: {plan:?}");
+        assert_eq!(plan.len(), 4, "plan: {plan:?}");
         assert!(plan[0].contains("-p tracel-deploy-test"), "plan: {plan:?}");
         assert!(plan[1].starts_with("rotate "), "plan: {plan:?}");
+        assert!(
+            plan[2].starts_with("after-rotate: verify install"),
+            "plan: {plan:?}"
+        );
+        assert!(
+            plan[3].starts_with("after-rotate: write deploy stamp"),
+            "plan: {plan:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn insertion_points_do_not_affect_a_caller_owned_plan() {
+    fn insertion_points_apply_to_a_caller_owned_plan_too() {
         let dir = temp_workspace("insertion-without-defaults");
         let context = default_plan_context(&dir);
         let events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
@@ -3438,13 +2856,172 @@ mod tests {
             .run()
             .expect("a caller-owned plan");
 
-        assert_eq!(report.steps.len(), 1, "steps: {:?}", report.steps);
+        assert_eq!(report.steps().len(), 3, "steps: {:?}", report.steps());
         assert_eq!(
             *events.borrow(),
-            ["own"],
-            "the insertion points shape the default plan only"
+            ["inserted", "also-inserted", "own"],
+            "0.4: the AfterBuild slot is part of the timeline, not of the default plan"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The public "would the rotation install anything?" predicate - the one
+    /// the service entries decide their skip on.
+    #[test]
+    fn install_is_current_answers_whether_the_rotation_would_install() {
+        let dir = temp_workspace("install-is-current");
+        let context = default_plan_context(&dir);
+        assert!(
+            !install_is_current(&context),
+            "a missing install is not current"
+        );
+
+        std::fs::write(context.built_binary_path(), "built bytes").expect("built");
+        std::fs::write(&context.install_path, "built bytes").expect("install");
+        assert!(install_is_current(&context), "identical bytes are current");
+
+        std::fs::write(&context.install_path, "stale bytes").expect("install");
+        assert!(!install_is_current(&context), "different bytes are stale");
+
+        let mut forced = default_plan_context(&dir);
+        std::fs::write(forced.built_binary_path(), "built bytes").expect("built");
+        std::fs::write(&forced.install_path, "built bytes").expect("install");
+        forced.force = true;
+        assert!(!install_is_current(&forced), "--force always installs");
+
+        let mut dry_run = default_plan_context(&dir);
+        std::fs::write(dry_run.built_binary_path(), "built bytes").expect("built");
+        std::fs::write(&dry_run.install_path, "built bytes").expect("install");
+        dry_run.dry_run = true;
+        assert!(!install_is_current(&dry_run), "a dry run installs nothing");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 0.4: every entry lands in `report.events` with the phase it ran at, and a
+    /// handler that reports `Outcome::Skipped` does not fail the plan.
+    #[test]
+    fn handlers_report_their_phase_and_outcome() {
+        let context = test_context();
+        let seen = Rc::new(RefCell::new(Vec::<String>::new()));
+        let reported = Rc::clone(&seen);
+
+        struct PhaseReporter {
+            seen: Rc<RefCell<Vec<String>>>,
+        }
+        impl Reporter for PhaseReporter {
+            fn handler_started(&mut self, phase: Phase, name: &str, _description: &str) {
+                self.seen
+                    .borrow_mut()
+                    .push(format!("start {} {name}", phase.label()));
+            }
+            fn handler_finished(&mut self, report: &DeployEventReport) {
+                self.seen.borrow_mut().push(format!(
+                    "finish {} {} {:?}",
+                    report.phase.label(),
+                    report.name,
+                    report.status
+                ));
+            }
+        }
+
+        let report = deploy(&context)
+            .defaults(false)
+            .reporter(PhaseReporter { seen: reported })
+            .on(
+                Phase::AfterBuild,
+                Handler::with_state("stop service", |_context, _state| {
+                    Ok(Outcome::skipped("nothing to install"))
+                }),
+            )
+            .on(
+                Phase::Finally,
+                Handler::new("start service", |_context| Ok(())),
+            )
+            .run()
+            .expect("a two-entry, caller-owned plan");
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [
+                "start after-build stop service",
+                "finish after-build stop service Skipped",
+                "start finally start service",
+                "finish finally start service Success",
+            ]
+        );
+        assert_eq!(report.events.len(), 2, "events: {:?}", report.events);
+        assert_eq!(report.events[0].phase, Phase::AfterBuild);
+        assert!(report.events[0].is_skipped());
+        assert_eq!(
+            report.events[0].detail.as_deref(),
+            Some("nothing to install")
+        );
+        assert_eq!(report.events[1].phase, Phase::Finally);
+        assert!(!report.events[1].is_failed());
+        // The 0.3 views of the same run: a slot entry is a step, a lifecycle
+        // entry is a hook.
+        assert_eq!(report.steps().len(), 1, "steps: {:?}", report.steps());
+        assert_eq!(report.steps()[0].status, StepStatus::Skipped);
+        assert_eq!(report.hooks().len(), 1, "hooks: {:?}", report.hooks());
+        assert!(report.hooks()[0].error.is_none());
+    }
+
+    /// A failing handler reaches the reporter as a `Failed` event, fails the
+    /// deploy, and still runs `on_error` and `finally`.
+    #[test]
+    fn a_failed_handler_is_reported_and_still_runs_on_error_and_finally() {
+        let context = test_context();
+        let order = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let failure = Rc::new(RefCell::new(None::<StepStatus>));
+        let reported_failure = Rc::clone(&failure);
+
+        struct FailureReporter {
+            failure: Rc<RefCell<Option<StepStatus>>>,
+        }
+        impl Reporter for FailureReporter {
+            fn handler_finished(&mut self, report: &DeployEventReport) {
+                if report.is_failed() {
+                    *self.failure.borrow_mut() = Some(report.status);
+                }
+            }
+        }
+
+        let on_error_order = Rc::clone(&order);
+        let finally_order = Rc::clone(&order);
+        let error = deploy(&context)
+            .defaults(false)
+            .reporter(FailureReporter {
+                failure: reported_failure,
+            })
+            .on(
+                Phase::AfterBuild,
+                Handler::new("stop service", |_context| {
+                    anyhow::bail!("no service to stop")
+                }),
+            )
+            .on(
+                Phase::OnError,
+                Handler::new("rollback", move |_context| {
+                    on_error_order.borrow_mut().push("on-error");
+                    Ok(())
+                }),
+            )
+            .on(
+                Phase::Finally,
+                Handler::new("start service", move |_context| {
+                    finally_order.borrow_mut().push("finally");
+                    Ok(())
+                }),
+            )
+            .run()
+            .expect_err("the failing entry fails the deploy");
+
+        let text = format!("{error:#}");
+        assert!(text.contains("stop service failed"), "text: {text}");
+        assert!(text.contains("no service to stop"), "text: {text}");
+        assert_eq!(order.borrow().as_slice(), ["on-error", "finally"]);
+        assert_eq!(*failure.borrow(), Some(StepStatus::Failed));
     }
 
     #[test]

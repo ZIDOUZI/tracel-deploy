@@ -234,7 +234,7 @@ start -> probe` loop needs, instead of every consumer writing its own pid
 files, detached spawn, and readiness probe:
 
 ```toml
-tracel-deploy = { version = "0.2", features = ["service"] }
+tracel-deploy = { version = "0.4", features = ["service"] }
 ```
 
 - `ServiceSpec` describes one service: name, binary, args, env, cwd, log file,
@@ -249,9 +249,11 @@ tracel-deploy = { version = "0.2", features = ["service"] }
 - `start_detached(&spec)` checks the recorded state, then the readiness probe,
   then scans running processes for the resolved image, so an instance started by
   a scheduled task that never wrote a state file is detected instead of spawned
-  twice. Windows children get `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`
+  twice. Windows children get `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`
   (retried without the breakaway flag when the enclosing job forbids it), Linux
-  children get their own session.
+  children get their own session. `CREATE_NO_WINDOW` gives the child a console
+  without a window, and the console programs it starts inherit that console, so
+  nothing on the path can pop a console window over the desktop.
 - `start_and_wait_ready(&spec, retries, interval, timeout)` starts and probes;
   failures report the last `LOG_TAIL_LINES` lines of the service log.
 - State files are `<state_dir>/<name>.service` (`key=value`, written to a
@@ -346,6 +348,10 @@ run in it:
    to build, the rotation is a no-op while the installed binary is already that
    build output, and a real change is built, rotated, verified, and stamped.
 
+The queued child runs with a console that has no window, and the console
+programs it starts inherit it, so a deploy never puts a console window on the
+screen - not while cargo builds, and not for a plan step that runs a shell.
+
 A consumer's `deploy` command therefore needs four lines rather than its own
 argv rewriting, log handling, and detached spawn. `queue_deploy` uses the `argv`
 it is given verbatim, so the `child_argv` call is not optional:
@@ -412,3 +418,4 @@ Any edit to `.codex/hooks.json` invalidates the recorded hook trust hash, so an
 edited hook has to be re-approved (Codex `/hooks`) or it is skipped silently. A
 dry run is never queued: `should_queue` is false while `--dry-run` is set, so
 the plan is rendered by the calling process and stays where it can be read.
+

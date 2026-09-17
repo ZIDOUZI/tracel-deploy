@@ -216,7 +216,7 @@ start -> probe` loop needs, instead of every consumer writing its own pid
 files, detached spawn, and readiness probe:
 
 ```toml
-tracel-deploy = { version = "0.2", features = ["service"] }
+tracel-deploy = { version = "0.4", features = ["service"] }
 ```
 
 - `ServiceSpec` describes one service: name, binary, args, env, cwd, log file,
@@ -231,9 +231,11 @@ tracel-deploy = { version = "0.2", features = ["service"] }
 - `start_detached(&spec)` checks the recorded state, then the readiness probe,
   then scans running processes for the resolved image, so an instance started by
   a scheduled task that never wrote a state file is detected instead of spawned
-  twice. Windows children get `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`
+  twice. Windows children get `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`
   (retried without the breakaway flag when the enclosing job forbids it), Linux
-  children get their own session.
+  children get their own session. `CREATE_NO_WINDOW` gives the child a console
+  without a window, and the console programs it starts inherit that console, so
+  nothing on the path can pop a console window over the desktop.
 - `start_and_wait_ready(&spec, retries, interval, timeout)` starts and probes;
   failures report the last `LOG_TAIL_LINES` lines of the service log.
 - State files are `<state_dir>/<name>.service` (`key=value`, written to a
@@ -341,3 +343,4 @@ state convention the deploy stamp and the service module use.
 prefix, normalizes separators, ignores case) and case-sensitively elsewhere, and
 `resolve_install_path` turns either an install directory or a full file path
 into the final binary path.
+

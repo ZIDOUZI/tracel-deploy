@@ -184,11 +184,12 @@ fn parse_package_list(input: syn::parse::ParseStream) -> syn::Result<Vec<syn::Li
 /// }
 /// ```
 ///
-/// The generated dispatcher takes the workspace root from the xtask crate's
-/// `CARGO_MANIFEST_DIR` (the xtask lives in `<root>/xtask`), deploys every
-/// listed package with `tracel_deploy::run_deploy`, and prefixes a failure with
-/// `<xtask crate> deploy: ` so the deploy log stays greppable.
-///
+/// The generated dispatcher resolves the workspace root with
+/// `tracel_deploy::WorkspaceRoot::detect`: `--workspace` wins, then this crate's
+/// `CARGO_MANIFEST_DIR` (the xtask lives in `<root>/xtask`), then the
+/// environment, then the current directory. It deploys every listed package with
+/// `tracel_deploy::run_deploy` and prefixes a failure with `<xtask crate>
+/// deploy: ` so the deploy log stays greppable.
 /// ```compile_fail
 /// // `packages` writes the handler, so it cannot be combined with `handler`.
 /// #[tracel_deploy_macros::deploy_commands(Deploy, packages = ["my-app"], handler = run)]
@@ -267,10 +268,15 @@ pub fn deploy_commands(attr: TokenStream, item: TokenStream) -> TokenStream {
                 _environment: tracel_deploy::__private::tracel_xtask::prelude::Environment,
                 _context: tracel_deploy::__private::tracel_xtask::prelude::Context,
             ) -> tracel_deploy::__private::anyhow::Result<()> {
-                let root = ::std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .expect("the xtask crate must live below the workspace root");
-                tracel_deploy::run_deploy(&command, root, &[#(#packages),*])
+                // The workspace root is detected here, where this crate's
+                // `CARGO_MANIFEST_DIR` is known: `--workspace` wins, then this
+                // manifest directory, then the environment, then the current
+                // directory.
+                let root = tracel_deploy::WorkspaceRoot::detect(
+                    tracel_deploy::DetectHint::new(command.common.workspace.as_deref())
+                        .manifest_dir(::std::path::Path::new(env!("CARGO_MANIFEST_DIR"))),
+                )?;
+                tracel_deploy::run_deploy(&command, root.path(), &[#(#packages),*])
                     .map(|_| ())
                     .map_err(|error| {
                         tracel_deploy::__private::anyhow::anyhow!(

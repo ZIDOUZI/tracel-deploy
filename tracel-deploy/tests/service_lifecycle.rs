@@ -368,8 +368,8 @@ fn resolve_binary_finds_path_entries_and_reports_missing_files() {
     );
 }
 
-/// Windows: `DETACHED_PROCESS` leaves the child without a console, which is the
-/// observable difference to a plain `spawn` that inherits ours.
+/// Windows: the detached child gets its own console without a window, which is
+/// the observable difference to a plain `spawn` that inherits ours.
 #[cfg(windows)]
 #[test]
 fn start_detached_leaves_the_windows_child_without_a_console() {

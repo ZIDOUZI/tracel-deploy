@@ -7,8 +7,10 @@
 //! 1. The hook calls `xtask deploy --background`.
 //! 2. That process does not deploy: [`child_argv`] swaps `--background` for
 //!    `--child`, and [`queue_deploy`] re-spawns the same executable - detached,
-//!    with that argv - redirecting stdout to `<state_dir>/deploy.log` and stderr
-//!    to `<state_dir>/deploy-error.log`, and returns the child's pid at once.
+//!    with that argv, and with a console that has no window, so neither the
+//!    child nor the programs it starts (cargo, a plan's shell) can put one on
+//!    the screen - redirecting stdout to `<state_dir>/deploy.log` and stderr to
+//!    `<state_dir>/deploy-error.log`, and returns the child's pid at once.
 //! 3. The child runs the ordinary plan: cargo decides whether there is anything
 //!    to build, the rotation is a no-op while the installed binary is already
 //!    that build output, and a real change is rotated, verified, and stamped.
@@ -315,6 +317,69 @@ mod tests {
         }
     }
 
+    /// This test binary's name of the helper that stands in for the console
+    /// program a queued child starts (`cargo build`, a plan's shell). The
+    /// helpers are re-run through `--exact <name> --ignored`, so the name is
+    /// the one the harness filters on, module path included.
+    #[cfg(windows)]
+    const CONSOLE_HELPER: &str = "background::tests::console_helper_for_background_tests";
+    /// This test binary's name of the helper that is the queued child and
+    /// starts [`CONSOLE_HELPER`].
+    #[cfg(windows)]
+    const CONSOLE_CHILD_HELPER: &str =
+        "background::tests::console_child_helper_for_background_tests";
+
+    /// Windows: what console this process runs with.
+    #[cfg(windows)]
+    mod console {
+        use std::ffi::c_void;
+
+        #[allow(non_snake_case)]
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetConsoleWindow() -> *mut c_void;
+        }
+
+        #[allow(non_snake_case)]
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn IsWindowVisible(hwnd: *mut c_void) -> i32;
+        }
+
+        /// `console=<0|1> visible=<0|1>`: whether this process has a console
+        /// window, and whether that window is on screen.
+        pub fn report() -> String {
+            let hwnd = unsafe { GetConsoleWindow() };
+            if hwnd.is_null() {
+                return "console=0 visible=0".to_string();
+            }
+            let visible = unsafe { IsWindowVisible(hwnd) } != 0;
+            format!("console=1 visible={}", u8::from(visible))
+        }
+    }
+
+    /// Windows helper: the console program started by the queued child.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper for a_queued_child_never_puts_a_console_window_on_screen"]
+    fn console_helper_for_background_tests() {
+        println!("console-helper={}", console::report());
+    }
+
+    /// Windows helper: the queued child, which starts a console program the
+    /// way a real plan starts cargo.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper for a_queued_child_never_puts_a_console_window_on_screen"]
+    fn console_child_helper_for_background_tests() {
+        let executable = env::current_exe().expect("locate the test binary");
+        let status = Command::new(executable)
+            .args(["--exact", CONSOLE_HELPER, "--ignored", "--nocapture"])
+            .status()
+            .expect("start the console program");
+        println!("console-child-status={}", u8::from(status.success()));
+    }
+
     fn wait_for_log(path: &Path, marker: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -394,6 +459,38 @@ mod tests {
 
         let log = wait_for_log(&dir.join(DEPLOY_LOG), "queued by the detached child");
         assert!(log.contains("queued by the detached child"), "{log:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Windows: a queued child must not put a console window on the screen -
+    /// neither for itself nor for the console programs it starts, which is
+    /// what a `--background` deploy does when its plan builds with cargo or
+    /// runs a shell. A child with no console at all (`DETACHED_PROCESS`) made
+    /// the first of those programs allocate a new, *visible* console, so every
+    /// deploy popped a window over the desktop.
+    #[cfg(windows)]
+    #[test]
+    fn a_queued_child_never_puts_a_console_window_on_screen() {
+        let dir = temp_dir("no-console-window");
+        let executable = env::current_exe().expect("locate the test binary");
+        let argv = ["--exact", CONSOLE_CHILD_HELPER, "--ignored", "--nocapture"]
+            .map(OsString::from)
+            .to_vec();
+
+        let pid = queue_executable(&executable, &dir, None, argv).expect("queue the child");
+        assert!(pid > 0, "the child pid is the queue's handle");
+
+        // The status line is printed after the console program exited, so it
+        // also proves the program itself ran.
+        let log = wait_for_log(&dir.join(DEPLOY_LOG), "console-child-status=");
+        assert!(
+            log.contains("console-child-status=1"),
+            "the queued child has to run the console program: {log}"
+        );
+        assert!(
+            log.contains("console-helper=console=0 visible=0"),
+            "the console program must not have a window: {log}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

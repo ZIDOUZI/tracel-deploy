@@ -350,13 +350,13 @@ pub fn batch_deploy(
 /// rotation found the installed binary already equal to the built one (the
 /// default, where cargo decides whether there is anything to build).
 fn status_of(report: &DeployReport) -> TargetStatus {
-    let skipped = !report.steps.is_empty()
+    let skipped = !report.steps().is_empty()
         && report
-            .steps
+            .steps()
             .iter()
             .all(|step| step.status == StepStatus::Skipped);
     let rotation_skipped = report
-        .steps
+        .steps()
         .iter()
         .any(|step| step.name == "rotate" && step.status == StepStatus::Skipped);
     if skipped || rotation_skipped {
@@ -475,7 +475,7 @@ mod tests {
     /// agree on.
     fn steps(report: &DeployReport) -> Vec<(String, StepStatus)> {
         report
-            .steps
+            .steps()
             .iter()
             .map(|step| (step.name.clone(), step.status))
             .collect()
@@ -499,7 +499,8 @@ mod tests {
                 fixture.installed(),
                 fs::read_to_string(&fixture.source).expect("source")
             );
-            // Every target ran the default build + rotate plan, not a copy of it.
+            // Every target ran the default plan, not a copy of it: the build,
+            // the rotation, and the two post-rotation entries.
             let deploy = target
                 .deploy
                 .as_ref()
@@ -509,7 +510,12 @@ mod tests {
                     .iter()
                     .map(|step| step.0.as_str())
                     .collect::<Vec<_>>(),
-                ["cargo build", "rotate"]
+                [
+                    "cargo build",
+                    "rotate",
+                    "verify install",
+                    "write deploy stamp"
+                ]
             );
         }
     }
@@ -624,7 +630,7 @@ mod tests {
             .expect("a skipped target reports its steps");
         assert!(
             deploy
-                .steps
+                .steps()
                 .iter()
                 .any(|step| step.name == "rotate" && step.status == StepStatus::Skipped),
             "nothing was installed, so the rotation is skipped: {deploy:?}"
@@ -667,7 +673,7 @@ mod tests {
         let direct_again = deploy(&context).run().expect("second direct deploy");
         assert!(
             direct_again
-                .steps
+                .steps()
                 .iter()
                 .any(|step| step.name == "rotate" && step.status == StepStatus::Skipped),
             "the install is already current: {direct_again:?}"

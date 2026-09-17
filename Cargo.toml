@@ -3,7 +3,7 @@ resolver = "2"
 members = ["tracel-deploy", "tracel-deploy-macros"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
@@ -22,3 +22,4 @@ syn = { version = "2", features = ["full"] }
 # `XtaskArgs` for the `prelude` re-exports and the generated handler signature,
 # all of which exist on every published line.
 tracel-xtask = ">=0.3"
+

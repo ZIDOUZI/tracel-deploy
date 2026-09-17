@@ -4,7 +4,7 @@
 //! The module is compiled only with the `service` feature (off by default):
 //!
 //! ```toml
-//! tracel-deploy = { version = "0.2", features = ["service"] }
+//! tracel-deploy = { version = "0.4", features = ["service"] }
 //! ```
 //!
 //! It stays deliberately unopinionated about *what* a service is; it records
@@ -23,8 +23,9 @@
 //!
 //! Platform support:
 //!
-//! - Windows: children are created with `DETACHED_PROCESS |
-//!   CREATE_NEW_PROCESS_GROUP`, retried without `CREATE_BREAKAWAY_FROM_JOB` when
+//! - Windows: children are created with `CREATE_NO_WINDOW |
+//!   CREATE_NEW_PROCESS_GROUP` (a console without a window, which the programs
+//!   the child starts inherit), retried without `CREATE_BREAKAWAY_FROM_JOB` when
 //!   the enclosing job forbids breakaway (`ERROR_ACCESS_DENIED`). Stop uses
 //!   `TerminateProcess` (the `taskkill /F` equivalent) and the image path comes
 //!   from `QueryFullProcessImageNameW`; the process scan uses a
@@ -53,6 +54,10 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+
+pub mod deploy;
+
+pub use deploy::{ServiceStart, ServiceStop};
 
 /// Version of the state file format written by [`ServiceState::write`].
 pub const STATE_SCHEMA: u32 = 1;
@@ -443,6 +448,10 @@ pub fn stop(pid: u32, timeout: Duration) -> Result<()> {
 /// `state.binary`, or when the image path cannot be read at all: that keeps a
 /// recycled pid from taking an unrelated process down. The state file is left
 /// untouched so the operator can inspect it.
+///
+/// A rotated-aside copy of the recorded binary (`<binary>.old`,
+/// `<binary>.old-<stamp>`, written by the rotation when it moves a running
+/// destination out of the way) counts as the same service.
 pub fn stop_checked(state: &ServiceState, timeout: Duration) -> Result<StopReport> {
     if !is_alive(state.pid)? {
         return Ok(StopReport {
@@ -453,7 +462,7 @@ pub fn stop_checked(state: &ServiceState, timeout: Duration) -> Result<StopRepor
     }
     let expected = &state.binary;
     match executable_path(state.pid)? {
-        Some(actual) if same_binary(&actual, expected) => {}
+        Some(actual) if same_binary_or_rotated(&actual, expected) => {}
         Some(actual) => bail!(
             "refusing to stop pid {}: image {} does not match the recorded {}",
             state.pid,
@@ -736,7 +745,7 @@ pub fn find_running_instance(spec: &ServiceSpec) -> Result<Option<Instance>> {
         && is_alive(state.pid)?
     {
         let recorded = match executable_path(state.pid)? {
-            Some(actual) => same_binary(&actual, &state.binary),
+            Some(actual) => same_binary_or_rotated(&actual, &state.binary),
             // Unverifiable (another user, platform without image paths): trust
             // the state file, like a human operator would.
             None => true,
@@ -760,7 +769,7 @@ pub fn find_running_instance(spec: &ServiceSpec) -> Result<Option<Instance>> {
             continue;
         }
         if let Some(actual) = executable_path(pid)?
-            && same_binary(&actual, &binary)
+            && same_binary_or_rotated(&actual, &binary)
         {
             return Ok(Some(Instance::Scanned(pid)));
         }
@@ -1004,6 +1013,31 @@ fn same_binary(left: &Path, right: &Path) -> bool {
     let left = normalize_path(&canonical_or(left.to_path_buf()));
     let right = normalize_path(&canonical_or(right.to_path_buf()));
     left == right
+}
+
+/// [`same_binary`], plus a rotated-aside copy of the expected binary
+/// (`<binary>.old`, `<binary>.old-<stamp>`) in the same directory.
+///
+/// The rotation renames the running destination aside on Windows, so the
+/// instance that owns the install path can still be running from its backup -
+/// that is the recorded instance, not a recycled pid, and refusing to stop it
+/// would leave the deployment without a rotation target.
+fn same_binary_or_rotated(left: &Path, right: &Path) -> bool {
+    if same_binary(left, right) {
+        return true;
+    }
+    let (Some(left_name), Some(right_name)) = (left.file_name(), right.file_name()) else {
+        return false;
+    };
+    let left_name = left_name.to_string_lossy().to_lowercase();
+    let right_name = right_name.to_string_lossy().to_lowercase();
+    if !left_name.starts_with(&format!("{right_name}.old")) {
+        return false;
+    }
+    match (left.parent(), right.parent()) {
+        (Some(left_dir), Some(right_dir)) => normalize_path(left_dir) == normalize_path(right_dir),
+        _ => false,
+    }
 }
 
 #[cfg(windows)]
@@ -1420,5 +1454,40 @@ mod sys {
 
     pub fn candidate_pids(_image: &Path) -> Result<Vec<u32>> {
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::same_binary_or_rotated;
+
+    #[test]
+    fn a_rotated_aside_copy_still_counts_as_the_same_service() {
+        let installed = Path::new(r"C:\Users\me\.cargo\bin\app.exe");
+
+        assert!(same_binary_or_rotated(installed, installed));
+        assert!(same_binary_or_rotated(
+            Path::new(r"C:\Users\me\.cargo\bin\app.exe.old"),
+            installed
+        ));
+        assert!(same_binary_or_rotated(
+            Path::new(r"C:\Users\me\.cargo\bin\app.exe.old-20260916T101010"),
+            installed
+        ));
+        // A different image, and the same name in another directory, are not it.
+        assert!(!same_binary_or_rotated(
+            Path::new(r"C:\Users\me\.cargo\bin\other.exe"),
+            installed
+        ));
+        assert!(!same_binary_or_rotated(
+            Path::new(r"C:\tmp\app.exe.old"),
+            installed
+        ));
+        assert!(!same_binary_or_rotated(
+            Path::new(r"C:\Users\me\.cargo\bin\appx.exe.old"),
+            installed
+        ));
     }
 }

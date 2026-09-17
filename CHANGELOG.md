@@ -1,5 +1,148 @@
 # Changelog
 
+## 0.4.0
+
+### Timeline model (0.4.0 groundwork)
+
+- `plan::phase` (new): `Phase` - the lifecycle events (`Preflight`, `Pre`, `Post`,
+  `OnError`, `Finally`) plus the timeline slots (`Build`, `AfterBuild`, `Rotate`,
+  `AfterRotate`) - and `Handler` (`new` / `with_state` / `describe` /
+  `skip_when`), `Outcome` (`Done` / `Skipped`), and `RunState` (what the run
+  knows: `installed`, `phases_done`, `notes`, a typed `set` / `get` / `take`
+  slot, and `service` / `stopped_service` under the `service` feature). The phase
+  enum carries no data on purpose: registration-time configuration lives in the
+  handler, per-run facts in `RunState`, per-instance data (pid, args, listen,
+  log) in `ServiceState`, and results in `Outcome`.
+- `plan.rs` moved to `plan/mod.rs` for the planned module split
+  (`plan/phase.rs` today; `plan/steps.rs` and `plan/report.rs` later).
+- `RotateStep::backup_cleanup_retry(Some(BackupRetry::new()))`: the plan step can
+  use the deferred backup cleanup `RotateOptions` already had, so a consumer no
+  longer has to call `rotate()` from a custom step (which a dry run rendered as
+  `custom step (opaque)`).
+- `service`: an image that is a rotated-aside copy of the recorded binary
+  (`<binary>.old`, `<binary>.old-<stamp>`) counts as the same instance in
+  `stop_checked` and `find_running_instance`. The rotation moves a running
+  destination aside on Windows, and refusing to stop that copy left the
+  deployment without a rotation target.
+- Still to come for 0.4.0: `DeployBuilder::on` / `insert` running the plan
+  through the phases, `DeployEventReport`, `service::ServiceStop` /
+  `service::ServiceStart`, and `run_deploy_with` plus workspace detection.
+
+### The plan runs on the phase timeline
+
+- `DeployBuilder::on(phase, handler)`, `insert(handler)` (uses
+  `Handler::at` / the handler's default phase), and `defaults(bool)`: the plan is
+  one timeline of `(Phase, Handler)` entries, executed in `Phase::ORDER` with
+  the 0.3 failure rules (a failing step stops its phase and every later phase
+  except `on-error` and `finally`; a failing hook does not stop its own phase).
+- The 0.3 builder methods (`preflight`, `pre`, `post`, `on_error`, `finally`,
+  `step`, `insert_after_default_build`, `insert_before_default_rotate`,
+  `without_defaults`) are thin wrappers over `on` / `insert`, and keep the 0.3
+  plan lines and report names byte-identical.
+- `insert_after_default_build` / `insert_before_default_rotate` now apply to a
+  caller-owned plan too (`defaults(false)`): `AfterBuild` is a slot on the
+  timeline, not part of the default plan, and steps registered there run in call
+  order.
+- The "the rotation found nothing to install" decision reads the `Rotate` slot's
+  outcome (`RunState::rotation`) instead of a recorded step index, so it works
+  for a caller-owned plan as well.
+- `Handler` accepts built-in steps (`From<DeployStep>`, and the three step
+  types), so `on(Phase::Rotate, RotateStep::from_context(context))` and a
+  closure handler are registered the same way. Lines a handler records with
+  `RunState::note` are forwarded to the reporter.
+- Removed: `DeployHookEntry` (the `DeployHook` alias stays). `DeployPlan`'s
+  public fields are gone; use `handlers(phase)`.
+### Structured events, and the post-rotation entries on the timeline
+
+- `DeployReport::events: Vec<DeployEventReport>`: every entry that ran, in
+  execution order, with `phase`, `name`, `status`, `detail`, `duration`,
+  `exit_code`, `artifacts`, and `error`. `report.steps` and `report.hooks` keep
+  the 0.3 shape (the slot phases and the lifecycle phases) and document
+  themselves as the 0.3 views of the same run.
+- `StepStatus::Failed`: only a [`DeployEventReport`] carries it. A failed entry
+  is reported through `Reporter::handler_finished` and `report.events`; the run
+  itself returns the error, as before.
+- `Reporter::handler_started(phase, name, description)` and
+  `Reporter::handler_finished(&DeployEventReport)`: a reporter can now follow
+  the timeline phase by phase. The 0.3 `step_started` / `step_finished` are
+  still called (by the built-in steps, and for handlers at a slot phase).
+- `RunState::{warn, warnings}`: a non-fatal problem a handler records is
+  forwarded to `Reporter::warning`, which `quiet` does not suppress.
+- The install verification and the deployment stamp are entries at
+  `Phase::AfterRotate` now, registered ahead of the caller's entries, instead of
+  calls after the plan: they show up in a dry run (`after-rotate: verify
+  install`, `after-rotate: write deploy stamp`), they report
+  `Outcome::Skipped` when the rotation found the install current, and a
+  caller-owned plan gets them too (`verify_install(true)` /
+  `write_deploy_stamp(true)`). A plan without a rotation still verifies and
+  stamps, like 0.3 did.
+### Service entries on the timeline
+
+- `service::ServiceStop` (default phase `AfterBuild`) and
+  `service::ServiceStart` (default phase `Finally`): the
+  `build -> stop service -> rotate -> start service` pair as library entries.
+  `ServiceStop` remembers the instance it found (`RunState::set_stopped_service`),
+  skips without touching the process when `install_is_current` says the rotation
+  will find the install current, and otherwise calls `stop_service` (which
+  refuses to kill a pid that is not the recorded image, and accepts a
+  rotated-aside copy). `ServiceStart` keeps an instance that is still running,
+  reuses the stopped instance's arguments (rewritten by a caller's
+  `configure` closure), starts the binary, waits for the readiness probe when
+  one is configured, and publishes the new `ServiceState` (pid, args, listen)
+  through `RunState::set_service` - so a later entry, or the caller, reads the
+  pid instead of parsing output.
+- `pub fn install_is_current(&DeployContext) -> bool`: the public form of the
+  rotation's skip condition, what a stop entry decides its skip on.
+- `service/deploy.rs` and the `plan/phase.rs` split: `service.rs` and `plan.rs`
+  became module directories for the planned layout.
+### Workspace detection and `run_deploy_with`
+
+- `WorkspaceRoot::detect(DetectHint)`: the root is detected in a documented
+  order - the explicit `--workspace <dir>` wins, then the consumer's
+  `CARGO_MANIFEST_DIR` (what `#[deploy_commands(...)]` bakes in; the library
+  cannot supply it, because `env!` inside the library expands to the library's
+  own directory), then the `CARGO_MANIFEST_DIR` the environment carries (set by
+  `cargo run`, inherited by the queued child), then the nearest ancestor with a
+  `[workspace]` manifest, and finally an error that names the flag.
+- `--workspace <dir>` on `DeployCmdArgs`. The queued child gets
+  `--workspace <root>` appended to its command line (unless it carries one
+  already), so it resolves the same root wherever it is started, and a
+  `--workspace` that contradicts the root the command was given is an error
+  instead of a silent override.
+- `run_deploy_with(args, root, packages, plan)`: the checkout deploy with a
+  caller-owned plan - the queue branch, the state directory, the
+  `queued ... (pid=...)` line, and the per-package loop stay in the library
+  while the entries are the consumer's.
+- The `deploy_commands(packages = [...])` dispatcher resolves the root through
+  `WorkspaceRoot::detect` with the manifest directory baked in.
+### Layout and report cleanup
+
+- `plan.rs` is `plan/{mod,phase,steps,report}.rs` and `service.rs` is
+  `service/{mod,deploy}.rs`: the plan engine (builder, timeline execution,
+  locks, stamps) stays in `plan/mod.rs`, the built-in entries (`CargoBuildStep`,
+  `RotateStep`, `RunStep`, the verification predicate) live in `plan/steps.rs`,
+  and the report types plus the reporter live in `plan/report.rs`.
+- `DeployReport` carries `events` only. `report.steps()` and `report.hooks()`
+  are the 0.3 views (the slot phases, and the lifecycle phases) computed from
+  it, and `DeployHookReport` is gone: a lifecycle entry's `succeeded` is
+  `DeployEventReport::error.is_none()`. `Reporter::step_finished` still takes a
+  `DeployStepReport` - that is what a built-in step reports.
+- Still to come for 0.4.0: the consumer migrations (mcp-hub, codex-router,
+  judo, zellij-plugins) and the release itself.
+
+### No console window anywhere below a detached child
+
+- `detach::spawn_detached` - what the `--background` deploy queue and the
+  `service` helpers use - creates the child with `CREATE_NO_WINDOW` instead of
+  `DETACHED_PROCESS`. A process with no console at all makes the first console
+  program it starts allocate a new one, and Windows puts that console in a
+  visible window: every queued deploy popped a console window over the desktop
+  as soon as its plan started cargo - or any shell (a `pwsh`/`powershell` step
+  showed up as that window). The replacement child owns a console without a
+  window and hands it down to the programs it starts, so the whole subtree stays
+  invisible; the process group, the breakaway and the `ERROR_ACCESS_DENIED`
+  retry are unchanged.
+
 ## 0.3.0
 
 The staleness decision moves to the tools that own it - cargo decides whether
@@ -169,3 +312,4 @@ mcp-hub's dry-run rendering should read `DeployReport::plan` instead of
 Initial release: `deploy_commands`, `DeployCmdArgs`, the `deploy` builder with
 pre/post hooks, cargo build / rotate / run steps, and cross-platform
 running-binary rotation.
+

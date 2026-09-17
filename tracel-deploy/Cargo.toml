@@ -17,7 +17,7 @@ service = []
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-tracel-deploy-macros = { version = "0.3.0", path = "../tracel-deploy-macros" }
+tracel-deploy-macros = { version = "0.4.0", path = "../tracel-deploy-macros" }
 tracel-xtask.workspace = true
 
 [dev-dependencies]
@@ -27,3 +27,4 @@ tracel-xtask.workspace = true
 # Floor only, like the `tracel-xtask` dependency above: the consumer's version
 # wins, and the lock keeps this crate on the line it was tested with.
 xtask-macros = { package = "tracel-xtask-macros", version = ">=0.3" }
+

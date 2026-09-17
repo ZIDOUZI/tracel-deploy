@@ -50,6 +50,7 @@ use crate::{
     command::DeployArgs,
     context::{DeployContext, checkout_state_dir},
     plan::DeployReport,
+    state::same_file_path,
 };
 
 /// What [`run_deploy`] did.
@@ -92,21 +93,62 @@ pub fn run_deploy(
     workspace_root: &Path,
     packages: &[&str],
 ) -> Result<DeployOutcome> {
-    run_deploy_with(
+    run_deploy_inner(
         args,
         workspace_root,
         packages,
         env::args_os().skip(1),
         &queue_deploy,
+        &default_checkout_plan,
     )
 }
 
-fn run_deploy_with(
+/// [`run_deploy`] with a caller-owned plan.
+///
+/// `plan` turns a package's [`DeployContext`] into a [`DeployReport`]: the
+/// checkout conventions stay the same, the entries are the caller's
+/// (`defaults(false)` plus whatever the checkout needs - a service stop at
+/// `AfterBuild`, a start at `Finally`, a check at `AfterRotate`). The queue
+/// branch, the state directory, the `queued ... (pid=...)` line, and the
+/// per-package loop still belong to the library:
+///
+/// ```ignore
+/// tracel_deploy::run_deploy_with(&args, root, &["my-app"], |context| {
+///     tracel_deploy::deploy(context)
+///         .on(Phase::AfterBuild, ServiceStop::new(&spec))
+///         .on(Phase::Finally, ServiceStart::new(&spec).probe(probe))
+///         .run()
+/// })?;
+/// ```
+pub fn run_deploy_with(
+    args: &DeployArgs,
+    workspace_root: &Path,
+    packages: &[&str],
+    plan: impl Fn(&DeployContext) -> Result<DeployReport>,
+) -> Result<DeployOutcome> {
+    run_deploy_inner(
+        args,
+        workspace_root,
+        packages,
+        env::args_os().skip(1),
+        &queue_deploy,
+        &plan,
+    )
+}
+
+/// The default plan of a checkout deploy: the ordinary build + rotation (plus
+/// the install verification and the deployment stamp the default plan adds).
+fn default_checkout_plan(context: &DeployContext) -> Result<DeployReport> {
+    crate::deploy(context).run()
+}
+
+fn run_deploy_inner(
     args: &DeployArgs,
     workspace_root: &Path,
     packages: &[&str],
     argv: impl IntoIterator<Item = OsString>,
     queue: &impl Fn(&Path, Option<&Path>, Vec<OsString>) -> Result<u32>,
+    plan: &impl Fn(&DeployContext) -> Result<DeployReport>,
 ) -> Result<DeployOutcome> {
     if packages.is_empty() {
         bail!("run_deploy needs at least one package: name the binaries this checkout installs");
@@ -117,6 +159,18 @@ fn run_deploy_with(
     if packages.len() > 1 {
         reject_single_binary_flags(args)?;
     }
+    // The explicit root has to agree with the one the caller resolved: a
+    // `--workspace` that names a different checkout is a mistake, not an
+    // override (the macro passes the flag into `WorkspaceRoot::detect`).
+    if let Some(explicit) = &args.common.workspace
+        && !same_file_path(explicit, workspace_root)
+    {
+        bail!(
+            "`--workspace {}` contradicts the workspace root {} this command was given",
+            explicit.display(),
+            workspace_root.display()
+        );
+    }
 
     if args.queue.should_queue(args.common.dry_run) {
         let state_dir = args
@@ -124,7 +178,8 @@ fn run_deploy_with(
             .state_dir
             .clone()
             .unwrap_or_else(|| checkout_state_dir(workspace_root));
-        let pid = queue(&state_dir, Some(workspace_root), child_argv(argv))?;
+        let argv = with_workspace(child_argv(argv), workspace_root);
+        let pid = queue(&state_dir, Some(workspace_root), argv)?;
         if !args.common.quiet {
             println!("queued {} redeploy (pid={pid})", packages.join(", "));
         }
@@ -134,11 +189,28 @@ fn run_deploy_with(
     let mut reports = Vec::with_capacity(packages.len());
     for package in packages {
         let context = DeployContext::for_checkout(&args.common, workspace_root, *package)?;
-        reports.push(crate::deploy(&context).run()?);
+        reports.push(plan(&context)?);
     }
     Ok(DeployOutcome::Deployed(reports))
 }
 
+/// Add `--workspace <root>` to a queued child's command line unless it already
+/// carries the flag.
+///
+/// The child then resolves the same root the parent did, no matter which
+/// directory it happens to start in; the queue already starts it in the root,
+/// this makes it explicit.
+fn with_workspace(mut argv: Vec<OsString>, workspace_root: &Path) -> Vec<OsString> {
+    let present = argv.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg == "--workspace" || arg.starts_with("--workspace=")
+    });
+    if !present {
+        argv.push("--workspace".into());
+        argv.push(workspace_root.as_os_str().to_os_string());
+    }
+    argv
+}
 fn reject_single_binary_flags(args: &DeployArgs) -> Result<()> {
     let named = [
         ("--package", args.common.package.is_some()),
@@ -228,12 +300,13 @@ mod tests {
             Ok(4242)
         };
 
-        let outcome = run_deploy_with(
+        let outcome = run_deploy_inner(
             &args,
             &root,
             &["my-app"],
             ["deploy", "--background"].map(OsString::from),
             &queue,
+            &default_checkout_plan,
         )
         .expect("queue");
         assert!(matches!(outcome, DeployOutcome::Queued { pid: 4242 }));
@@ -246,6 +319,50 @@ mod tests {
             argv.contains(&OsString::from("--child"))
                 && !argv.contains(&OsString::from("--background")),
             "the child deploys instead of queueing again: {argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair[0] == "--workspace" && Path::new(&pair[1]) == root.as_path()),
+            "the queued child is told which workspace to deploy: {argv:?}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A caller-owned plan replaces the default one per package, and still gets
+    /// the checkout conventions.
+    #[test]
+    fn a_caller_owned_plan_runs_for_every_package() {
+        let root = temp_dir("custom-plan");
+        let args = deploy_args(&["xtask", "--dry-run", "--quiet"]);
+        let seen = RefCell::new(Vec::new());
+
+        let outcome = run_deploy_with(&args, &root, &["server", "worker"], |context| {
+            seen.borrow_mut().push(context.package.clone());
+            crate::deploy(context).run()
+        })
+        .expect("the caller-owned plan runs");
+
+        let DeployOutcome::Deployed(reports) = outcome else {
+            panic!("a dry run never queues");
+        };
+        assert_eq!(reports.len(), 2);
+        assert_eq!(*seen.borrow(), ["server", "worker"]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An explicit `--workspace` that names a different checkout is a mistake:
+    /// the resolved root and the flag have to agree.
+    #[test]
+    fn a_workspace_flag_naming_another_checkout_is_rejected() {
+        let root = temp_dir("root");
+        let other = temp_dir("other");
+        let other = other.to_str().expect("utf-8 path");
+        let args = deploy_args(&["xtask", "--dry-run", "--workspace", other]);
+
+        let error = run_deploy(&args, &root, &["my-app"]).expect_err("the roots disagree");
+        assert!(
+            format!("{error:#}").contains("contradicts the workspace root"),
+            "error: {error:#}"
         );
         fs::remove_dir_all(&root).ok();
     }
