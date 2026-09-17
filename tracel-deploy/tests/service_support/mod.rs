@@ -3,8 +3,8 @@
 //! Every test that starts a process uses its own copy of the test binary as the
 //! service image, driven through `--exact <helper> --ignored`:
 //!
-//! - the copy has a unique path, so the image-path scan of `start_detached`
-//!   cannot match another test's process (or the test process itself),
+//! - the copy has a unique path, so a scan of the fixture's image cannot match
+//!   another test's process (or the test process itself),
 //! - the helper is plain Rust, so the tests do not depend on shell built-ins and
 //!   behave the same on Windows and Unix (the same trick
 //!   `rotate::tests::replaces_a_running_binary` uses for a running binary),
@@ -49,6 +49,19 @@ pub const LOG_MARKER: &str = "service-log-marker";
 /// Arguments that run exactly one ignored helper test.
 pub fn helper_args(helper: &'static str) -> [&'static str; 4] {
     ["--exact", helper, "--ignored", "--nocapture"]
+}
+
+/// A libtest option value that is inert (no test name matches it) but shows up
+/// in the instance's command line, so tests can use `--skip <INSTANCE_MARKER>`
+/// as the "started by the deploy loop" marker an `InstanceFilter` keys on.
+pub const INSTANCE_MARKER: &str = "tracel-deploy-instance-marker";
+
+/// [`helper_args`] plus the `--skip <INSTANCE_MARKER>` marker pair.
+pub fn marked_helper_args(helper: &'static str) -> Vec<String> {
+    let mut args: Vec<String> = helper_args(helper).into_iter().map(str::to_owned).collect();
+    args.push("--skip".to_owned());
+    args.push(INSTANCE_MARKER.to_owned());
+    args
 }
 
 pub fn helper_stdio() {
@@ -174,6 +187,28 @@ impl Fixture {
         let state = service::start_detached(spec).expect("start_detached");
         self.track(state.pid);
         state
+    }
+
+    /// Spawn the fixture image directly, without the library and without a state
+    /// file, and wait until it is alive; `Drop` stops it again.
+    pub fn spawn_unrecorded<I, S>(&mut self, args: I) -> u32
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut command = Command::new(&self.image);
+        command
+            .args(args.into_iter().map(Into::into))
+            .stdin(std::process::Stdio::null());
+        let child = command.spawn().expect("spawn the fixture instance");
+        let pid = child.id();
+        drop(child);
+        self.track(pid);
+        assert!(
+            self.wait_for_alive(pid, Duration::from_secs(10)),
+            "spawned fixture pid {pid} did not come up"
+        );
+        pid
     }
 
     pub fn wait_for_alive(&self, pid: u32, timeout: Duration) -> bool {

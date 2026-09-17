@@ -245,11 +245,18 @@ tracel-deploy = { version = "0.4", features = ["service"] }
   so a recycled pid cannot take an unrelated process down; `stop(pid, timeout)`
   is the unguarded primitive. Both are idempotent (`StopOutcome::NotRunning`),
   and `stop_service(&spec, timeout)` also covers an instance that runs without
-  a state file.
+  a state file, when the spec carries an `instance_filter` (see below).
 - `start_detached(&spec)` checks the recorded state, then the readiness probe,
-  then scans running processes for the resolved image, so an instance started by
-  a scheduled task that never wrote a state file is detected instead of spawned
-  twice. Windows children get `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`
+  and - when the spec carries an `instance_filter` - scans running processes for
+  the resolved image. A candidate only counts when its `ProcessInfo` (pid,
+  image, command line) passes the predicate. **Without a filter the scan does
+  not run**: the same binary may run as several instances (a stdio client per
+  session next to one detached server, for example), and only the caller knows
+  which shape is the service. The common predicate is
+  `InstanceFilter::command_line_contains_any(["--mode sse", "--background"])`,
+  which is what detects an instance a scheduled task started without a state
+  file instead of spawning a duplicate.
+  Windows children get `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`
   (retried without the breakaway flag when the enclosing job forbids it), Linux
   children get their own session. `CREATE_NO_WINDOW` gives the child a console
   without a window, and the console programs it starts inherit that console, so
@@ -258,8 +265,8 @@ tracel-deploy = { version = "0.4", features = ["service"] }
   failures report the last `LOG_TAIL_LINES` lines of the service log.
 - State files are `<state_dir>/<name>.service` (`key=value`, written to a
   sibling `.tmp` and renamed into place). A missing, truncated, or unparsable
-  file counts as "no state", so the guardrails fall back to probing and scanning
-  instead of guessing.
+  file counts as "no state", so the guardrails fall back to probing (and to the
+  filtered scan, when one is configured) instead of guessing.
 
 ```rust
 use std::time::Duration;

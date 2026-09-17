@@ -115,10 +115,10 @@ pub mod prelude {
     pub use crate::rotate::{BackupRetry, CleanupReport, cleanup_pending_backups};
     #[cfg(feature = "service")]
     pub use crate::service::{
-        Instance, ProbeKind, ProbeReport, ProbeSpec, ServiceSpec, ServiceStart, ServiceState,
-        ServiceStop, StopOutcome, StopReport, executable_path, find_running_instance, is_alive,
-        probe_once, resolve_binary, start_and_wait_ready, start_detached, stop, stop_checked,
-        stop_service, tail_log, wait_ready,
+        Instance, InstanceFilter, ProbeKind, ProbeReport, ProbeSpec, ProcessInfo, ServiceSpec,
+        ServiceStart, ServiceState, ServiceStop, StopOutcome, StopReport, executable_path,
+        find_running_instance, is_alive, probe_once, resolve_binary, start_and_wait_ready,
+        start_detached, stop, stop_checked, stop_service, tail_log, wait_ready,
     };
     pub use crate::{
         BatchOptions, BatchReport, CargoBuildStep, DEPLOY_ERROR_LOG, DEPLOY_LOG, DeployArgs,

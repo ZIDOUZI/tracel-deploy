@@ -16,10 +16,14 @@
 //!    an unrelated process down. [`stop`] is the unguarded primitive for
 //!    callers that verified the pid themselves.
 //! 2. **Never start a second instance.** [`start_detached`] looks at the state
-//!    file, then at the readiness probe, and finally scans running processes for
-//!    the resolved image path. An instance started by a scheduled task that
-//!    never wrote a state file is therefore detected before a duplicate is
-//!    spawned.
+//!    file, then at the readiness probe, and - when the spec carries an
+//!    [`InstanceFilter`] - finally scans running processes that match both the
+//!    resolved image path and the filter. An instance started by a scheduled
+//!    task that never wrote a state file is therefore detected before a
+//!    duplicate is spawned; without a filter the scan does not run, because an
+//!    executable is not an identity (the same binary may run as several
+//!    differently shaped instances, for example a stdio client per session next
+//!    to one detached server).
 //!
 //! Platform support:
 //!
@@ -29,9 +33,12 @@
 //!   the enclosing job forbids breakaway (`ERROR_ACCESS_DENIED`). Stop uses
 //!   `TerminateProcess` (the `taskkill /F` equivalent) and the image path comes
 //!   from `QueryFullProcessImageNameW`; the process scan uses a
-//!   `CreateToolhelp32Snapshot` of the process list.
+//!   `CreateToolhelp32Snapshot` of the process list and reads a candidate's
+//!   command line out of its PEB (`NtQueryInformationProcess` +
+//!   `ReadProcessMemory`).
 //! - Linux: children get their own session (`setsid`), stop sends `SIGTERM` and
-//!   escalates to `SIGKILL`, and the image path comes from `/proc/<pid>/exe`.
+//!   escalates to `SIGKILL`, the image path comes from `/proc/<pid>/exe`, and
+//!   the command line from `/proc/<pid>/cmdline`.
 //! - Other Unix (macOS, BSD): start and stop behave the same way, but the OS has
 //!   no portable way to read another process' image path, so
 //!   [`executable_path`] returns `Ok(None)` and [`stop_checked`] refuses instead
@@ -47,9 +54,10 @@
 //! and scanning, which is the safe behaviour for a deploy loop.
 
 use std::{
-    env, fs, io,
+    env, fmt, fs, io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -74,6 +82,72 @@ const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Extra grace granted to a forced kill before [`stop`] gives up.
 const FORCE_KILL_GRACE: Duration = Duration::from_secs(2);
 
+/// What the library knows about a running process when it applies an
+/// [`InstanceFilter`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessInfo {
+    /// Pid of the candidate process.
+    pub pid: u32,
+    /// Absolute image path, when the OS reports one for this process.
+    pub image: Option<PathBuf>,
+    /// Full command line, when it can be read for this process.
+    ///
+    /// `None` means "unknown" (another user, a protected process, or a platform
+    /// without a portable way to read it); a filter must treat that as "not an
+    /// instance" instead of guessing.
+    pub command_line: Option<String>,
+}
+
+/// Decides whether a running process is an instance of the service.
+///
+/// The image-path scan in [`find_running_instance`] applies it to every
+/// candidate whose image path matches [`ServiceSpec::binary`]; **without a
+/// filter the scan does not run at all**, because an executable is not an
+/// identity: the same binary may run as several differently shaped instances (a
+/// stdio client per session next to one detached server, for example), and only
+/// the caller knows which shape is the service.
+///
+/// ```ignore
+/// let filter = InstanceFilter::command_line_contains_any(["--mode sse", "--background"]);
+/// ```
+#[derive(Clone)]
+pub struct InstanceFilter(Arc<dyn Fn(&ProcessInfo) -> bool + Send + Sync>);
+
+impl InstanceFilter {
+    pub fn new(filter: impl Fn(&ProcessInfo) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(filter))
+    }
+
+    /// The common case: the command line contains at least one of `markers`.
+    ///
+    /// `markers` are matched as substrings of the full command line, so pass
+    /// the text of the argument(s) that identify the service shape
+    /// (`--mode sse`, `--background`, ...).
+    pub fn command_line_contains_any<I, S>(markers: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let markers: Vec<String> = markers.into_iter().map(Into::into).collect();
+        Self::new(move |info| {
+            info.command_line.as_deref().is_some_and(|command_line| {
+                markers.iter().any(|marker| command_line.contains(marker))
+            })
+        })
+    }
+
+    /// Whether `info` is an instance of the service.
+    pub fn matches(&self, info: &ProcessInfo) -> bool {
+        (self.0)(info)
+    }
+}
+
+impl fmt::Debug for InstanceFilter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InstanceFilter(..)")
+    }
+}
+
 /// What to start, where its pid is recorded, and how to probe it.
 ///
 /// ```ignore
@@ -83,9 +157,10 @@ const FORCE_KILL_GRACE: Duration = Duration::from_secs(2);
 ///     "C:/Users/me/.local/state/mcp-hub/hub.log",
 ///     "C:/Users/me/.local/state/mcp-hub",
 /// )
-/// .args(["--listen", "127.0.0.1:8791"])
+/// .args(["--mode", "sse", "--listen", "127.0.0.1:8791"])
 /// .env("RUST_LOG", "info")
-/// .probe(ProbeSpec::tcp("127.0.0.1:8791".parse()?));
+/// .probe(ProbeSpec::tcp("127.0.0.1:8791".parse()?))
+/// .instance_filter(InstanceFilter::command_line_contains_any(["--mode sse"]));
 /// ```
 #[derive(Debug, Clone)]
 pub struct ServiceSpec {
@@ -105,6 +180,10 @@ pub struct ServiceSpec {
     pub state_dir: PathBuf,
     /// Optional readiness probe, used by [`wait_ready`] and the start guardrail.
     pub probe: Option<ProbeSpec>,
+    /// Optional identity check for the image-path scan in
+    /// [`find_running_instance`]; see [`InstanceFilter`] for why the scan is
+    /// skipped entirely when it is `None`.
+    pub instance_filter: Option<InstanceFilter>,
 }
 
 impl ServiceSpec {
@@ -123,6 +202,7 @@ impl ServiceSpec {
             log_file: log_file.into(),
             state_dir: state_dir.into(),
             probe: None,
+            instance_filter: None,
         }
     }
 
@@ -152,6 +232,13 @@ impl ServiceSpec {
 
     pub fn probe(mut self, probe: ProbeSpec) -> Self {
         self.probe = Some(probe);
+        self
+    }
+
+    /// Require the image-path scan to pass `filter` before a candidate counts
+    /// as an instance; see [`InstanceFilter`].
+    pub fn instance_filter(mut self, filter: InstanceFilter) -> Self {
+        self.instance_filter = Some(filter);
         self
     }
 
@@ -373,7 +460,8 @@ pub struct StopReport {
 pub enum Instance {
     /// The pid recorded in the state file is alive.
     Recorded(u32),
-    /// A running process was matched by its image path.
+    /// A running process matched both the image path and the spec's
+    /// [`ServiceSpec::instance_filter`].
     Scanned(u32),
     /// The readiness probe already answers (no pid known).
     Ready,
@@ -390,7 +478,9 @@ impl Instance {
     pub fn describe(self) -> String {
         match self {
             Self::Recorded(pid) => format!("state file records live pid {pid}"),
-            Self::Scanned(pid) => format!("running pid {pid} matches the image path"),
+            Self::Scanned(pid) => {
+                format!("running pid {pid} matches the image path and the instance filter")
+            }
             Self::Ready => "the readiness probe already answers".to_owned(),
         }
     }
@@ -487,8 +577,10 @@ pub fn stop_checked(state: &ServiceState, timeout: Duration) -> Result<StopRepor
 /// Stop the instance described by `spec` and remove the state file.
 ///
 /// Order: the state file (image checked by [`stop_checked`]) -> a running
-/// process matching the resolved image path (the scheduled-task case that wrote
-/// no state file) -> nothing. Idempotent: stopping a service that is not running
+/// process that matches both the resolved image path and
+/// [`ServiceSpec::instance_filter`] (the scheduled-task case that wrote no state
+/// file) -> nothing. Without a filter the scan is skipped, so only the recorded
+/// instance can be stopped. Idempotent: stopping a service that is not running
 /// reports [`StopOutcome::NotRunning`].
 pub fn stop_service(spec: &ServiceSpec, timeout: Duration) -> Result<StopReport> {
     let state_file = spec.state_file();
@@ -514,9 +606,14 @@ pub fn stop_service(spec: &ServiceSpec, timeout: Duration) -> Result<StopReport>
             outcome: StopOutcome::NotRunning,
             pid: None,
             detail: format!(
-                "the readiness probe for {} still answers but no running process matches {}",
+                "the readiness probe for {} still answers but no instance of {} is known{}; \
+                 nothing was stopped",
                 spec.name,
-                spec.binary.display()
+                spec.binary.display(),
+                match &spec.instance_filter {
+                    Some(_) => " and none matches the instance filter",
+                    None => " (no instance filter is set, so the image was not scanned)",
+                }
             ),
         }),
         None => Ok(StopReport {
@@ -530,8 +627,9 @@ pub fn stop_service(spec: &ServiceSpec, timeout: Duration) -> Result<StopReport>
 /// Start `spec` detached and record its pid in `<state_dir>/<name>.service`.
 ///
 /// The guardrails run first: a recorded live pid, an already answering probe, or
-/// a running process whose image path matches the resolved binary abort the start
-/// with an error instead of spawning a duplicate.
+/// (when [`ServiceSpec::instance_filter`] is set) a running process that matches
+/// both the resolved binary and the filter abort the start with an error instead
+/// of spawning a duplicate.
 ///
 /// stdout and stderr are appended to [`ServiceSpec::log_file`]. The returned
 /// [`ServiceState`] only reports that the process was created; use
@@ -735,9 +833,11 @@ pub fn tail_log(log_file: &Path, lines: usize) -> Result<String> {
 /// Detect an already running instance of `spec` without starting anything.
 ///
 /// Checks, in order: the live pid recorded in the state file (plus its image
-/// path when the OS can report it), the readiness probe, and finally a scan of
-/// running processes for the resolved image path. The calling process is never
-/// reported, so a deploy loop cannot mistake itself for the service.
+/// path when the OS can report it), the readiness probe, and finally - only when
+/// [`ServiceSpec::instance_filter`] is set - a scan of running processes whose
+/// image path matches the resolved binary and whose [`ProcessInfo`] passes the
+/// filter. The calling process is never reported, so a deploy loop cannot
+/// mistake itself for the service.
 pub fn find_running_instance(spec: &ServiceSpec) -> Result<Option<Instance>> {
     let state_file = spec.state_file();
     if let Some(state) = ServiceState::read(&state_file)?
@@ -761,6 +861,11 @@ pub fn find_running_instance(spec: &ServiceSpec) -> Result<Option<Instance>> {
         return Ok(Some(Instance::Ready));
     }
 
+    // An executable is not an identity: without a filter, a same-image process
+    // (a stdio client next to the service, for example) must never count.
+    let Some(filter) = &spec.instance_filter else {
+        return Ok(None);
+    };
     let Ok(binary) = resolve_binary(&spec.binary) else {
         return Ok(None);
     };
@@ -768,9 +873,18 @@ pub fn find_running_instance(spec: &ServiceSpec) -> Result<Option<Instance>> {
         if pid == std::process::id() {
             continue;
         }
-        if let Some(actual) = executable_path(pid)?
-            && same_binary_or_rotated(&actual, &binary)
-        {
+        let Some(actual) = executable_path(pid)? else {
+            continue;
+        };
+        if !same_binary_or_rotated(&actual, &binary) {
+            continue;
+        }
+        let info = ProcessInfo {
+            pid,
+            image: Some(actual),
+            command_line: sys::command_line(pid),
+        };
+        if filter.matches(&info) {
             return Ok(Some(Instance::Scanned(pid)));
         }
     }
@@ -1093,6 +1207,22 @@ mod sys {
     const ERROR_INVALID_PARAMETER: i32 = 87;
     const WAIT_TIMEOUT: u32 = 258;
     const MAX_PATH: usize = 260;
+    const PROCESS_VM_READ: u32 = 0x0010;
+    const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
+    /// `PEB.ProcessParameters`, the same offset on x64 and arm64.
+    #[cfg(target_pointer_width = "64")]
+    const PEB_PROCESS_PARAMETERS_OFFSET: usize = 0x20;
+    /// `PEB.ProcessParameters` on 32-bit Windows.
+    #[cfg(target_pointer_width = "32")]
+    const PEB_PROCESS_PARAMETERS_OFFSET: usize = 0x10;
+    /// `RTL_USER_PROCESS_PARAMETERS.CommandLine` (a `UNICODE_STRING`).
+    #[cfg(target_pointer_width = "64")]
+    const PROCESS_PARAMETERS_COMMAND_LINE_OFFSET: usize = 0x70;
+    /// `RTL_USER_PROCESS_PARAMETERS.CommandLine` on 32-bit Windows.
+    #[cfg(target_pointer_width = "32")]
+    const PROCESS_PARAMETERS_COMMAND_LINE_OFFSET: usize = 0x40;
+    /// Upper bound for a command line read out of the PEB, in bytes.
+    const MAX_COMMAND_LINE_BYTES: usize = 32 * 1024;
 
     #[allow(non_snake_case)]
     #[link(name = "kernel32")]
@@ -1110,6 +1240,25 @@ mod sys {
         fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut c_void;
         fn Process32FirstW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
         fn Process32NextW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn ReadProcessMemory(
+            handle: *mut c_void,
+            address: *const c_void,
+            buffer: *mut c_void,
+            size: usize,
+            read: *mut usize,
+        ) -> i32;
+    }
+
+    #[allow(non_snake_case)]
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQueryInformationProcess(
+            handle: *mut c_void,
+            class: u32,
+            info: *mut c_void,
+            size: u32,
+            returned: *mut u32,
+        ) -> i32;
     }
 
     /// `PROCESSENTRY32W`, the subset `Process32FirstW` fills in.
@@ -1153,6 +1302,24 @@ mod sys {
                 .to_string_lossy()
                 .into_owned()
         }
+    }
+
+    /// `PROCESS_BASIC_INFORMATION`, the subset the PEB lookup needs.
+    #[repr(C)]
+    struct ProcessBasicInformation {
+        _reserved1: *mut c_void,
+        peb_base_address: *mut c_void,
+        _reserved2: [*mut c_void; 2],
+        _unique_process_id: usize,
+        _reserved3: *mut c_void,
+    }
+
+    /// `UNICODE_STRING`.
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        _maximum_length: u16,
+        buffer: *mut u16,
     }
 
     /// Process handle that closes itself.
@@ -1208,6 +1375,105 @@ mod sys {
         }
         buffer.truncate(size as usize);
         Ok(Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer))))
+    }
+
+    /// Full command line of `pid`, read out of the target's PEB
+    /// (`NtQueryInformationProcess` + `ReadProcessMemory`): no child process,
+    /// console window or PowerShell is involved.
+    ///
+    /// `None` means "unknown": the process is gone or protected, this user may
+    /// not read it, or it is a 32-bit process read from a 64-bit caller (the PEB
+    /// layout differs). An [`InstanceFilter`](crate::service::InstanceFilter)
+    /// must treat that as "not an instance" instead of guessing.
+    pub fn command_line(pid: u32) -> Option<String> {
+        let handle = match open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ).ok()? {
+            Open::Alive(handle) => handle,
+            Open::Denied | Open::Gone => return None,
+        };
+        let mut info = ProcessBasicInformation {
+            _reserved1: std::ptr::null_mut(),
+            peb_base_address: std::ptr::null_mut(),
+            _reserved2: [std::ptr::null_mut(); 2],
+            _unique_process_id: 0,
+            _reserved3: std::ptr::null_mut(),
+        };
+        let mut returned = 0_u32;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle.0,
+                PROCESS_BASIC_INFORMATION_CLASS,
+                &mut info as *mut ProcessBasicInformation as *mut c_void,
+                std::mem::size_of::<ProcessBasicInformation>() as u32,
+                &mut returned,
+            )
+        };
+        if status < 0 || info.peb_base_address.is_null() {
+            return None;
+        }
+
+        let parameters = read_pointer(
+            handle.0,
+            info.peb_base_address,
+            PEB_PROCESS_PARAMETERS_OFFSET,
+        )?;
+        if parameters == 0 {
+            return None;
+        }
+        let mut command_line = UnicodeString {
+            length: 0,
+            _maximum_length: 0,
+            buffer: std::ptr::null_mut(),
+        };
+        if !read_exact(
+            handle.0,
+            (parameters as *const u8).wrapping_add(PROCESS_PARAMETERS_COMMAND_LINE_OFFSET),
+            &mut command_line as *mut UnicodeString as *mut c_void,
+            std::mem::size_of::<UnicodeString>(),
+        ) {
+            return None;
+        }
+        let bytes = command_line.length as usize;
+        if bytes == 0 || bytes > MAX_COMMAND_LINE_BYTES || command_line.buffer.is_null() {
+            return None;
+        }
+        let mut wide = vec![0_u16; bytes.div_ceil(2)];
+        if !read_exact(
+            handle.0,
+            command_line.buffer as *const u8,
+            wide.as_mut_ptr() as *mut c_void,
+            bytes,
+        ) {
+            return None;
+        }
+        while wide.last() == Some(&0) {
+            wide.pop();
+        }
+        (!wide.is_empty()).then(|| String::from_utf16_lossy(&wide))
+    }
+
+    /// Read a pointer-sized value at `base + offset` out of `handle`'s process.
+    fn read_pointer(handle: *mut c_void, base: *const c_void, offset: usize) -> Option<usize> {
+        let mut value = 0_usize;
+        let address = (base as *const u8).wrapping_add(offset);
+        read_exact(
+            handle,
+            address,
+            &mut value as *mut usize as *mut c_void,
+            std::mem::size_of::<usize>(),
+        )
+        .then_some(value)
+    }
+
+    /// `ReadProcessMemory`, `true` only when all `size` bytes were read.
+    fn read_exact(
+        handle: *mut c_void,
+        address: *const u8,
+        buffer: *mut c_void,
+        size: usize,
+    ) -> bool {
+        let mut read = 0_usize;
+        let ok = unsafe { ReadProcessMemory(handle, address.cast(), buffer, size, &mut read) };
+        ok != 0 && read == size
     }
 
     /// There is no graceful signal for console programs on Windows, so both
@@ -1356,6 +1622,31 @@ mod sys {
         }
     }
 
+    /// Full command line of `pid`, read from `/proc/<pid>/cmdline` on Linux.
+    ///
+    /// `None` means "unknown": the process is gone, it belongs to another user,
+    /// or the platform has no `/proc`. An
+    /// [`InstanceFilter`](crate::service::InstanceFilter) must treat that as
+    /// "not an instance" instead of guessing.
+    pub fn command_line(pid: u32) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+            let text = bytes
+                .split(|byte| *byte == 0)
+                .filter(|arg| !arg.is_empty())
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!text.is_empty()).then_some(text)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            None
+        }
+    }
+
     pub fn request_exit(pid: u32) -> Result<()> {
         signal(pid, SIGTERM)
     }
@@ -1438,6 +1729,10 @@ mod sys {
 
     pub fn executable_path(_pid: u32) -> Result<Option<PathBuf>> {
         Ok(None)
+    }
+
+    pub fn command_line(_pid: u32) -> Option<String> {
+        None
     }
 
     pub fn request_exit(pid: u32) -> Result<()> {

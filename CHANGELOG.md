@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.1
+
+### A service instance needs an identity, not just an image
+
+- `service::InstanceFilter` + `ServiceSpec::instance_filter(..)`: the image-path
+  scan in `find_running_instance` now only reports a candidate whose
+  `ProcessInfo` (pid, image, command line) passes the caller's predicate, and a
+  **spec without a filter does not scan at all** - an executable is not an
+  identity. Field case (2026-09-17): one `codex-scheduler.exe` ran as the
+  deploy-managed SSE server *and* as one stdio client per Codex session; the old
+  scan saw a stdio instance as "already running" and stopped one instead of the
+  server.
+- `InstanceFilter::command_line_contains_any(["--mode sse", "--background"])` is
+  the ready-made predicate for the common case; `InstanceFilter::new(closure)`
+  takes anything else. `ProcessInfo` and `InstanceFilter` are re-exported from
+  the prelude.
+- The command line is read without spawning a shell: Windows through the
+  target's PEB (`NtQueryInformationProcess` + `ReadProcessMemory`), Linux
+  through `/proc/<pid>/cmdline`. An unreadable command line reports
+  `command_line: None`, which a filter must treat as "not an instance".
+- `Instance::Scanned` now means "image path *and* filter matched";
+  `stop_service` on a probe that still answers but has no matching instance
+  reports `NotRunning` with a message that says whether a filter was set.
+
 ## 0.4.0
 
 ### Timeline model (0.4.0 groundwork)

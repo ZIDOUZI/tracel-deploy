@@ -11,8 +11,19 @@ mod support;
 
 use std::{fs, path::PathBuf, time::Duration};
 
-use support::{Fixture, LOG_MARKER, SLEEP_HELPER, STDIO_HELPER, helper_args};
-use tracel_deploy::service::{self, Instance, ProbeSpec, ServiceState, StopOutcome};
+use support::{
+    Fixture, INSTANCE_MARKER, LOG_MARKER, SLEEP_HELPER, STDIO_HELPER, helper_args,
+    marked_helper_args,
+};
+use tracel_deploy::service::{
+    self, Instance, InstanceFilter, ProbeSpec, ServiceState, StopOutcome,
+};
+
+/// The predicate that tells the two shapes of the fixture image apart: only the
+/// instances started with the marker pair count as the service.
+fn instance_filter() -> InstanceFilter {
+    InstanceFilter::command_line_contains_any([INSTANCE_MARKER])
+}
 
 /// Helper: writes to stdout and stderr, then exits.
 #[test]
@@ -319,9 +330,11 @@ fn start_detached_refuses_a_second_instance_for_the_recorded_pid() {
 }
 
 #[test]
-fn stop_service_finds_an_instance_that_wrote_no_state_file() {
+fn stop_service_finds_a_filtered_instance_that_wrote_no_state_file() {
     let mut fixture = Fixture::new("scan");
-    let spec = fixture.spec(helper_args(SLEEP_HELPER));
+    let spec = fixture
+        .spec(marked_helper_args(SLEEP_HELPER))
+        .instance_filter(instance_filter());
     let state = fixture.start(&spec);
 
     ServiceState::remove(&spec.state_file());
@@ -329,7 +342,7 @@ fn stop_service_finds_an_instance_that_wrote_no_state_file() {
     assert_eq!(
         service::find_running_instance(&spec).expect("scan for the instance"),
         Some(Instance::Scanned(state.pid)),
-        "the image path scan finds an instance that wrote no state file"
+        "the filtered image-path scan finds an instance that wrote no state file"
     );
 
     let report = service::stop_service(&spec, Duration::from_secs(10))
@@ -341,6 +354,65 @@ fn stop_service_finds_an_instance_that_wrote_no_state_file() {
     let again = service::stop_service(&spec, Duration::from_secs(5)).expect("stop is idempotent");
     assert_eq!(again.outcome, StopOutcome::NotRunning);
     assert_eq!(again.pid, None);
+}
+
+/// The 2026-09-17 field case: one binary, two shapes. A same-image process that
+/// does not pass the filter must neither be stopped nor count as an instance.
+#[test]
+fn an_unmarked_instance_of_the_same_image_is_neither_stopped_nor_matched() {
+    let mut fixture = Fixture::new("unmarked");
+    let client = fixture.spawn_unrecorded(helper_args(SLEEP_HELPER));
+
+    let spec = fixture
+        .spec(marked_helper_args(SLEEP_HELPER))
+        .instance_filter(instance_filter());
+    assert_eq!(
+        service::find_running_instance(&spec).expect("scan for the instance"),
+        None,
+        "an unmarked same-image process must not count as the service"
+    );
+
+    let report = service::stop_service(&spec, Duration::from_secs(5)).expect("stop");
+    assert_eq!(report.outcome, StopOutcome::NotRunning);
+    assert_eq!(report.pid, None);
+    assert!(
+        service::is_alive(client).expect("the unmarked instance is alive"),
+        "the unmarked instance must keep running"
+    );
+
+    // The marked instance on the same image is the service: found, then stopped.
+    let deploy = fixture.spawn_unrecorded(marked_helper_args(SLEEP_HELPER));
+    assert_eq!(
+        service::find_running_instance(&spec).expect("scan for the instance"),
+        Some(Instance::Scanned(deploy))
+    );
+    let report = service::stop_service(&spec, Duration::from_secs(10)).expect("stop");
+    assert_eq!(report.outcome, StopOutcome::Terminated);
+    assert_eq!(report.pid, Some(deploy));
+    assert!(fixture.wait_for_exit(deploy, Duration::from_secs(10)));
+    assert!(
+        service::is_alive(client).expect("the unmarked instance is alive"),
+        "only the filtered instance was stopped"
+    );
+}
+
+#[test]
+fn without_an_instance_filter_the_image_scan_does_not_run() {
+    let mut fixture = Fixture::new("no-filter");
+    let pid = fixture.spawn_unrecorded(marked_helper_args(SLEEP_HELPER));
+
+    let spec = fixture.spec(marked_helper_args(SLEEP_HELPER));
+    assert_eq!(
+        service::find_running_instance(&spec).expect("scan for the instance"),
+        None,
+        "without a filter the scan must not claim a same-image process"
+    );
+    let report = service::stop_service(&spec, Duration::from_secs(5)).expect("stop");
+    assert_eq!(report.outcome, StopOutcome::NotRunning);
+    assert!(
+        service::is_alive(pid).expect("the instance is alive"),
+        "nothing may be stopped without a recorded instance"
+    );
 }
 
 #[test]
