@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.2
+
+### A queued deploy no longer holds the hook's stdio pipes
+
+- `detach::spawn_detached` clears `HANDLE_FLAG_INHERIT` on the calling
+  process's std handles for the duration of the spawn and restores them
+  afterwards. Windows runs `CreateProcess` with `bInheritHandles = TRUE`, so
+  the detached child used to inherit the stdout/stderr pipes of whatever
+  started the queue - in the field a Codex `Stop` hook runner. The runner keeps
+  the hook "running" until those pipes close, so it reached the hook's
+  `timeout` and killed the hook together with the deploy child still in its
+  job: the build stopped mid-crate and `.deploy.lock` stayed behind, blocking
+  the next deploy for the stale-lock window. Field case (2026-09-17, mcp-hub):
+  the release build died 28 s in - `"timeout": 30` - while the session stayed
+  open, and the next deploy was refused for 10 minutes.
+- Regression test:
+  `background::tests::a_queued_child_does_not_hold_the_queueing_commands_stdio`
+  - a queueing helper whose stdout is a pipe must see EOF as soon as it exits,
+  not when the queued child dies.
+
 ## 0.4.1
 
 ### A service instance needs an identity, not just an image

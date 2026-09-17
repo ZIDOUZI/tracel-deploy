@@ -413,12 +413,18 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
 }
 ```
 
-Three properties of that entry are deliberate:
+Four properties of that entry are deliberate:
 
 - `async: true` keeps the turn from waiting for the queue call; without it the
   hook blocks the turn until the command returns.
 - `timeout` is the *hook's* budget, not the deployment's - only the queue call
   runs inside it, the build happens in the detached child.
+- the queued child does not inherit the hook's std handles: a runner that owns
+  those pipes (Codex) keeps the hook *running* until they close, so a child
+  holding them open would be killed - together with everything else still in
+  the hook's job - when the timeout fires. `queue_deploy` clears the inherit
+  flag for the spawn, which is what lets a `timeout: 30` hook queue a build
+  that runs for minutes.
 - `Stop` fires per turn; `SessionEnd` only runs when a session actually ends.
 
 Any edit to `.codex/hooks.json` invalidates the recorded hook trust hash, so an

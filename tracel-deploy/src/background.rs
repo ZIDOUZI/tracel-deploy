@@ -153,6 +153,12 @@ pub fn child_argv(argv: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
 /// `working_dir` is the directory the child runs in (a Cargo workspace root, so
 /// the child finds the same workspace the hook was invoked from); `None` keeps
 /// the caller's working directory.
+///
+/// The child does not inherit the caller's std handles, so a supervisor that
+/// owns the queueing command's stdout/stderr (Codex's `Stop` hook runner) sees
+/// them close as soon as the queueing command exits. Otherwise it would keep
+/// the hook "running" for the whole deployment and kill it - and this child,
+/// while it is still in the hook's job - at the hook's timeout.
 pub fn queue_deploy(
     state_dir: &Path,
     working_dir: Option<&Path>,
@@ -262,6 +268,7 @@ fn json_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -328,6 +335,20 @@ mod tests {
     #[cfg(windows)]
     const CONSOLE_CHILD_HELPER: &str =
         "background::tests::console_child_helper_for_background_tests";
+    /// This test binary's name of the helper that stands in for a `Stop` hook:
+    /// it queues a long-lived child and exits at once. The helpers are re-run
+    /// through `--exact <name> --ignored`, so the name is the one the harness
+    /// filters on, module path included.
+    #[cfg(windows)]
+    const QUEUE_HELPER: &str = "background::tests::queue_and_exit_for_background_tests";
+    /// This test binary's name of the queued child, which has to outlive the
+    /// queueing helper by a wide margin.
+    #[cfg(windows)]
+    const PIPE_HOLDING_HELPER: &str = "background::tests::pipe_holding_child_for_background_tests";
+    /// How long the queued child lives. Long enough that a child which wrongly
+    /// held the helper's stdout cannot let the pipe close inside the deadline.
+    #[cfg(windows)]
+    const PIPE_HOLDING_SECS: u64 = 30;
 
     /// Windows: what console this process runs with.
     #[cfg(windows)]
@@ -378,6 +399,32 @@ mod tests {
             .status()
             .expect("start the console program");
         println!("console-child-status={}", u8::from(status.success()));
+    }
+
+    /// Windows helper: the queued child. It only has to stay alive far longer
+    /// than the queueing helper, so a pipe it wrongly held could not close
+    /// before the regression test's deadline.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper for a_queued_child_does_not_hold_the_queueing_commands_stdio"]
+    fn pipe_holding_child_for_background_tests() {
+        std::thread::sleep(Duration::from_secs(PIPE_HOLDING_SECS));
+    }
+
+    /// Windows helper: the queueing command - `deploy --background` in a `Stop`
+    /// hook. It queues the long-lived child and exits immediately; its stdout
+    /// is a pipe owned by whoever started it.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper for a_queued_child_does_not_hold_the_queueing_commands_stdio"]
+    fn queue_and_exit_for_background_tests() {
+        let dir = temp_dir("stdio-helper");
+        let executable = env::current_exe().expect("locate the test binary");
+        let argv = ["--exact", PIPE_HOLDING_HELPER, "--ignored"]
+            .map(OsString::from)
+            .to_vec();
+        let pid = queue_executable(&executable, &dir, None, argv).expect("queue the child");
+        println!("queued-pid={pid}");
     }
 
     fn wait_for_log(path: &Path, marker: &str) -> String {
@@ -492,6 +539,51 @@ mod tests {
             "the console program must not have a window: {log}"
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Windows: the queued child must not keep the queueing command's
+    /// stdout/stderr open. A `Stop` hook runner owns those pipes and treats the
+    /// hook as running until they close, so a child that inherited them was
+    /// killed - with everything else still in the hook's job - when the hook's
+    /// `timeout` fired, minutes into a real build, leaving `.deploy.lock`
+    /// behind. Before the fix the EOF below arrives only after the child dies;
+    /// the assertion fails long before that.
+    #[cfg(windows)]
+    #[test]
+    fn a_queued_child_does_not_hold_the_queueing_commands_stdio() {
+        let executable = env::current_exe().expect("locate the test binary");
+        let mut helper = Command::new(executable)
+            .args(["--exact", QUEUE_HELPER, "--ignored", "--nocapture"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the queueing helper");
+        let mut stdout = helper.stdout.take().expect("the helper's stdout");
+
+        let started = Instant::now();
+        let mut output = Vec::new();
+        stdout
+            .read_to_end(&mut output)
+            .expect("read the helper's stdout");
+        let waited = started.elapsed();
+
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            helper
+                .wait()
+                .expect("wait for the queueing helper")
+                .success(),
+            "the helper runs the queue path: {output}"
+        );
+        assert!(
+            output.contains("queued-pid="),
+            "the helper queued the long-lived child: {output}"
+        );
+        assert!(
+            waited < Duration::from_secs(10),
+            "the queued child must not hold the helper's stdout: EOF came only after \
+             {waited:?} (the child lives {PIPE_HOLDING_SECS}s)"
+        );
     }
 
     #[test]
