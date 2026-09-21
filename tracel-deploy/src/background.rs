@@ -198,67 +198,23 @@ pub fn queue_executable(
 /// `xtask_manifest` is the manifest of the xtask crate (`<root>/xtask/Cargo.toml`).
 /// A path containing whitespace is quoted.
 ///
-/// On Windows the payload is wrapped in [`hook_console_host`], so the hook
-/// leaves no console window behind even when the hook runner has no console of
-/// its own - the GUI hosts that spawn a hook command as the *first* console
-/// program of the turn.
+/// A hook runner that owns a console (a terminal pane, `codex exec`) passes it
+/// down and nothing appears; a runner with *no* console of its own makes
+/// Windows allocate a new console for the first console program the hook
+/// starts, and Windows puts a new console in a *visible* window - the `cargo`
+/// window that can flash on every turn. Wrapping the command in a GUI-subsystem
+/// host looked like the fix, but `conhost.exe --headless` was measured to
+/// return before its payload finished and to drop the payload's stdio and exit
+/// code, so the wrapper was reverted in 0.4.4. See
+/// `.scratch/background-deploy/issues/04-conhost-wrapper-rejected.md`.
 pub fn codex_stop_hook_command(xtask_manifest: &Path) -> String {
-    let payload = stop_hook_payload_command(xtask_manifest);
-    match hook_console_host() {
-        Some(host) => format!("{host} {payload}"),
-        None => payload,
-    }
-}
-
-/// The command that actually queues the deployment. This is the part
-/// consumers verify byte for byte; [`codex_stop_hook_command`] may put a
-/// console host in front of it.
-fn stop_hook_payload_command(xtask_manifest: &Path) -> String {
-    let manifest = quote_if_whitespace(xtask_manifest.display().to_string());
-    format!("cargo run --quiet --manifest-path {manifest} -- deploy --background")
-}
-
-/// The console host the hook command is wrapped in - `conhost.exe --headless` -
-/// or `None` on hosts that do not have it, which leaves the payload command as
-/// the whole command line.
-///
-/// A `Stop` hook runs `cargo`, a console program. A hook runner that owns a
-/// console (a terminal pane, `codex exec`) passes it down and nothing appears; a
-/// runner with *no* console at all makes Windows allocate a new console for that
-/// first console program, and Windows puts a new console in a **visible
-/// window** - the `cargo` window that flashes on every turn. `conhost.exe
-/// --headless` is a GUI-subsystem host: it never allocates a console window for
-/// itself, owns a console without a window, and hands that console to the
-/// program it starts. That is the same guarantee
-/// [`crate::detach::spawn_detached`] gives the queued child, applied to the hop
-/// above it. The wrapped program's stdout/stderr belong to that headless console
-/// rather than to the hook runner, which a fire-and-forget queue does not need:
-/// `deploy.log` and `deploy-error.log` stay the record of the deploy.
-#[cfg(windows)]
-fn hook_console_host() -> Option<String> {
-    let root = env::var_os("SystemRoot")?;
-    let conhost = Path::new(&root).join("System32").join("conhost.exe");
-    conhost.is_file().then(|| {
-        format!(
-            "{} --headless",
-            quote_if_whitespace(conhost.display().to_string())
-        )
-    })
-}
-
-/// Other platforms get the plain payload: there are no console windows to hide,
-/// and the hook runner passes its own stdio down.
-#[cfg(not(windows))]
-fn hook_console_host() -> Option<String> {
-    None
-}
-
-fn quote_if_whitespace(value: String) -> String {
-    if value.contains(char::is_whitespace) {
-        format!("\"{value}\"")
+    let manifest = xtask_manifest.display().to_string();
+    let manifest = if manifest.contains(char::is_whitespace) {
+        format!("\"{manifest}\"")
     } else {
-        value
-    }
+        manifest
+    };
+    format!("cargo run --quiet --manifest-path {manifest} -- deploy --background")
 }
 
 /// The Codex `Stop` hook entry that queues `command` after every turn, ready to
@@ -399,10 +355,6 @@ mod tests {
     /// queueing helper by a wide margin.
     #[cfg(windows)]
     const PIPE_HOLDING_HELPER: &str = "background::tests::pipe_holding_child_for_background_tests";
-    /// This test binary's name of the helper that reports what console the hook
-    /// command gave it.
-    #[cfg(windows)]
-    const CONSOLE_REPORT_HELPER: &str = "background::tests::console_report_helper_for_hook_tests";
     /// How long the queued child lives. Long enough that a child which wrongly
     /// held the helper's stdout cannot let the pipe close inside the deadline.
     #[cfg(windows)]
@@ -483,17 +435,6 @@ mod tests {
             .to_vec();
         let pid = queue_executable(&executable, &dir, None, argv).expect("queue the child");
         println!("queued-pid={pid}");
-    }
-
-    /// Windows helper: what console the hook command ends up with. The report
-    /// goes to the file named by `HOOK_CONSOLE_REPORT` rather than to stdout,
-    /// because the console host in front of the helper owns its std handles.
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "helper for the_hook_command_hides_the_console_a_console_less_runner_never_had"]
-    fn console_report_helper_for_hook_tests() {
-        let report = env::var("HOOK_CONSOLE_REPORT").expect("HOOK_CONSOLE_REPORT");
-        fs::write(report, console::report()).expect("write the console report");
     }
 
     fn wait_for_log(path: &Path, marker: &str) -> String {
@@ -657,7 +598,7 @@ mod tests {
 
     #[test]
     fn the_generated_hook_matches_the_verified_entry() {
-        let command = stop_hook_payload_command(Path::new(r"D:\rust\judo\xtask\Cargo.toml"));
+        let command = codex_stop_hook_command(Path::new(r"D:\rust\judo\xtask\Cargo.toml"));
         assert_eq!(
             command,
             r"cargo run --quiet --manifest-path D:\rust\judo\xtask\Cargo.toml -- deploy --background"
@@ -668,118 +609,10 @@ mod tests {
         );
     }
 
-    /// Windows: the hook command has to run through the GUI-subsystem console
-    /// host, or a console-less hook runner gets a visible `cargo` window.
-    #[cfg(windows)]
-    #[test]
-    fn the_hook_command_runs_through_a_console_host() {
-        let manifest = Path::new(r"D:\rust\judo\xtask\Cargo.toml");
-        let host = hook_console_host().expect("this Windows host has conhost.exe");
-        assert_eq!(
-            codex_stop_hook_command(manifest),
-            format!("{host} {}", stop_hook_payload_command(manifest))
-        );
-        let program = host
-            .strip_suffix(" --headless")
-            .expect("the host carries the headless switch")
-            .trim_matches('"');
-        assert!(program.ends_with("conhost.exe"), "{program}");
-        assert!(Path::new(program).is_file(), "{program} exists");
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn the_hook_command_has_nothing_to_wrap_off_windows() {
-        let manifest = Path::new("/work/app/xtask/Cargo.toml");
-        assert_eq!(
-            codex_stop_hook_command(manifest),
-            stop_hook_payload_command(manifest)
-        );
-    }
-
-    /// Windows: the hook command must not put a console window on the screen
-    /// when the hook runner has no console of its own.
-    ///
-    /// `CREATE_NEW_CONSOLE` models that runner: it is what Windows does for the
-    /// first console program a console-less process starts - allocate a new
-    /// console, and a new console is visible. The helper inside the wrapped
-    /// command then reports what it actually got: a console whose window is not
-    /// on screen (`visible=0`), which is what `conhost --headless` hands down.
-    #[cfg(windows)]
-    #[test]
-    fn the_hook_command_hides_the_console_a_console_less_runner_never_had() {
-        use std::os::windows::process::CommandExt as _;
-
-        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-        let dir = temp_dir("hook-console");
-        let report = dir.join("console.txt");
-        let executable = env::current_exe().expect("locate the test binary");
-        let host = hook_console_host().expect("this Windows host has conhost.exe");
-        let program = host
-            .strip_suffix(" --headless")
-            .expect("the host carries the headless switch")
-            .trim_matches('"');
-
-        let status = Command::new(program)
-            .arg("--headless")
-            .arg(&executable)
-            .args(["--exact", CONSOLE_REPORT_HELPER, "--ignored", "--nocapture"])
-            .env("HOOK_CONSOLE_REPORT", &report)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NEW_CONSOLE)
-            .status()
-            .expect("run the wrapped hook command");
-        assert!(
-            status.success(),
-            "the console host ran the helper: {status}"
-        );
-
-        let reported = wait_for_log(&report, "console=");
-        assert!(
-            reported.contains("visible=0") && !reported.contains("visible=1"),
-            "the hook command must not show a console window: {reported}"
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Windows: the control for the test above - the same helper *without* the
-    /// console host gets a visible console window. Ignored by default because it
-    /// puts a window on the screen on purpose; run it by hand to see the failure
-    /// the wrapper prevents.
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "flashes a console window on purpose; controls the_hook_command_hides_..."]
-    fn a_console_less_runner_flashes_a_bare_console_program() {
-        use std::os::windows::process::CommandExt as _;
-
-        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-        let dir = temp_dir("hook-console-control");
-        let report = dir.join("console.txt");
-        let executable = env::current_exe().expect("locate the test binary");
-
-        let status = Command::new(executable)
-            .args(["--exact", CONSOLE_REPORT_HELPER, "--ignored", "--nocapture"])
-            .env("HOOK_CONSOLE_REPORT", &report)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NEW_CONSOLE)
-            .status()
-            .expect("run the bare console program");
-        assert!(status.success(), "{status}");
-
-        let reported = wait_for_log(&report, "console=");
-        assert!(
-            reported.contains("console=1 visible=1"),
-            "the control has to reproduce the flash: {reported}"
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
     #[test]
     fn hook_commands_quote_paths_with_whitespace() {
         assert_eq!(
-            stop_hook_payload_command(Path::new(r"C:\work my app\xtask\Cargo.toml")),
+            codex_stop_hook_command(Path::new(r"C:\work my app\xtask\Cargo.toml")),
             "cargo run --quiet --manifest-path \"C:\\work my app\\xtask\\Cargo.toml\" -- deploy --background"
         );
         assert!(

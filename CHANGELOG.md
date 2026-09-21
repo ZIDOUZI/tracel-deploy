@@ -1,6 +1,32 @@
 # Changelog
 
+## 0.4.4
+
+### Revert the `conhost.exe --headless` hook wrapper shipped in 0.4.3
+
+- 0.4.3 wrapped the generated `Stop` hook command in `conhost.exe --headless`,
+  so a console-less (GUI) hook runner would not flash a `cargo` window.
+  Measured afterwards on Windows 11 26100, that host cannot carry the command:
+  it returns before its payload finishes (a 4 s payload was still unfinished
+  when conhost exited after 1.7 s), it never propagates the payload's exit code
+  (always 0), and it replaces the payload's stdout with its own console escape
+  sequences. Commands that carry quotes are mis-parsed - `cmd /c "echo hi>
+  file"` wrote nothing while the unquoted form worked. A `timeout: 30` hook
+  whose job is to queue a deployment cannot run under that.
+- `codex_stop_hook_command` is back to the plain `cargo run --quiet
+  --manifest-path … -- deploy --background`, with a comment that records why the
+  wrapper is not used, and the tests that asserted the wrapper are gone. The
+  `service::sys::spawn_detached` documentation fix from 0.4.3 stays.
+- Not in this release: a library-owned headless launcher (a GUI-subsystem
+  executable that starts the payload with `CREATE_NO_WINDOW`) was prototyped and
+  measured as a safe alternative - no window, payload completes, stdio and exit
+  code forwarded, about +0.1 s per hook - but it needs a binary that consumers
+  install, so it is a separate change.
+
 ## 0.4.3
+
+> Reverted in 0.4.4: the `conhost --headless` wrapper below drops its payload
+> (see the 0.4.4 entry).
 
 ### The `Stop` hook command no longer pops a console window
 
