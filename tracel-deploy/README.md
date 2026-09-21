@@ -345,7 +345,9 @@ repository's `Stop` hook once a turn is finished. The hook has a timeout and
 must not sit through a cargo build, so the deployment is *queued* rather than
 run in it:
 
-1. the hook calls `xtask deploy --background`;
+1. the hook calls `xtask deploy --background` - on Windows through
+   `conhost.exe --headless`, so the hook itself never allocates a console
+   window;
 2. `DeployQueueArgs` carries the two switches (`--background`, and the hidden
    `--child` the queued process gets), `child_argv` swaps the one for the other,
    and `queue_deploy` re-spawns the same executable detached with that command
@@ -358,6 +360,18 @@ run in it:
 The queued child runs with a console that has no window, and the console
 programs it starts inherit it, so a deploy never puts a console window on the
 screen - not while cargo builds, and not for a plan step that runs a shell.
+
+The hook command itself is wrapped the same way on Windows:
+`codex_stop_hook_command` puts `conhost.exe --headless` in front of the
+`cargo run`. A hook runner that owns a console passes it down and nothing
+appears, but a runner with *no* console of its own (a GUI host) would make
+Windows allocate a new, **visible** console for the first console program the
+hook starts - the `cargo` window that flashes on every turn. `conhost.exe
+--headless` is a GUI-subsystem host: it never allocates a console window for
+itself, owns a console without a window, and hands that console to the program
+it starts. The wrapped command's stdout/stderr belong to that headless console
+rather than to the hook runner; `deploy.log` and `deploy-error.log` stay the
+record of the deploy.
 
 A consumer's `deploy` command therefore needs four lines rather than its own
 argv rewriting, log handling, and detached spawn. `queue_deploy` uses the `argv`
@@ -401,7 +415,7 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         "hooks": [
           {
             "type": "command",
-            "command": "cargo run --quiet --manifest-path D:\\work\\my-app\\xtask\\Cargo.toml -- deploy --background",
+            "command": "C:\\Windows\\System32\\conhost.exe --headless cargo run --quiet --manifest-path D:\\work\\my-app\\xtask\\Cargo.toml -- deploy --background",
             "statusMessage": "my-app: queueing local redeploy",
             "timeout": 30,
             "async": true
@@ -413,7 +427,13 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
 }
 ```
 
-Four properties of that entry are deliberate:
+Five properties of that entry are deliberate:
+
+- the command runs through `conhost.exe --headless` on Windows (the example
+  above is the Windows form), so a hook runner without a console of its own
+  still shows no window: the console the hook runs in has no window, and the
+  `cargo` it starts inherits it. Hook output goes to that console instead of the
+  runner, which is why the deploy logs - not the hook's stdout - are the record.
 
 - `async: true` keeps the turn from waiting for the queue call; without it the
   hook blocks the turn until the command returns.

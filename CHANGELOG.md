@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.3
+
+### The `Stop` hook command no longer pops a console window
+
+- `background::codex_stop_hook_command` wraps its `cargo run ... -- deploy
+  --background` payload in `conhost.exe --headless` on Windows (when
+  `%SystemRoot%\System32\conhost.exe` exists; elsewhere the plain command is
+  used). A hook runner that owns a console passes it to the hook and nothing
+  appears, but a runner with *no* console - a GUI host - makes Windows allocate
+  a new, **visible** console for the first console program the hook starts: the
+  `cargo` window that flashed on every turn. `conhost.exe --headless` is a
+  GUI-subsystem host: it never allocates a console window for itself, owns a
+  console without a window, and hands that console to the program it starts, so
+  the whole hook is invisible no matter what the runner looks like. The wrapped
+  command's stdout/stderr belong to that headless console rather than to the
+  runner; `deploy.log` and `deploy-error.log` stay the record of the deploy.
+- Regression tests: `the_hook_command_runs_through_a_console_host` (the shape)
+  and `the_hook_command_hides_the_console_a_console_less_runner_never_had` (the
+  mechanism - `CREATE_NEW_CONSOLE` models the console-less runner, the helper
+  inside the command reports `console=0 visible=0`). The ignored control
+  `a_console_less_runner_flashes_a_bare_console_program` shows the failure the
+  wrapper prevents.
+- Docs: the `service::sys::spawn_detached` wrapper still described the old
+  `DETACHED_PROCESS` flags; it now names the delegated `CREATE_NO_WINDOW |
+  CREATE_NEW_PROCESS_GROUP` behaviour.
+- Migration: the generated `.codex/hooks.json` entry changes, so consumers
+  regenerate it and re-approve the hook (Codex `/hooks`). A hook whose trust
+  hash no longer matches is skipped silently.
+
 ## 0.4.2
 
 ### A queued deploy no longer holds the hook's stdio pipes

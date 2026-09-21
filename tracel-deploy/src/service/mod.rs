@@ -1499,10 +1499,12 @@ mod sys {
         Ok(())
     }
 
-    /// `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, plus
+    /// `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`, plus
     /// `CREATE_BREAKAWAY_FROM_JOB` when the enclosing job allows breakaway. A
     /// job that forbids it answers `ERROR_ACCESS_DENIED`; the retry then keeps
-    /// the plain detachment.
+    /// the plain detachment, which still keeps the console out of sight. See
+    /// [`crate::detach::spawn_detached`] for why the child owns a console
+    /// without a window instead of no console at all.
     pub fn spawn_detached(command: &mut Command) -> io::Result<Child> {
         crate::detach::spawn_detached(command)
     }
