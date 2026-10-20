@@ -172,11 +172,13 @@ trigger a redeploy. A missing or legacy stamp never skips.
 
 Every non-dry-run deployment takes a lock in `state_dir`
 (`<binary>.deploy.lock`), so two deployments of the same binary cannot rotate it
-concurrently. A lock a killed deployment left behind is taken over once it is
-older than `STALE_LOCK_AFTER` (10 minutes); a fresh one reports the owning pid
-and refuses. After a real rotation the installed binary is verified against the
-source (content hash, size, and - on Unix - the executable bit), and a
-`<binary>.stamp` file with the build-input, source, and destination fingerprints
+concurrently. A lock whose recorded pid is gone is taken over immediately; a
+live owner keeps it regardless of age and refreshes the lock while it works.
+`STALE_LOCK_AFTER` (10 minutes) remains the fallback when the OS cannot
+determine whether the owner is alive and its heartbeat has stopped. After a
+real rotation the installed binary is verified against the source (content
+hash, size, and - on Unix - the executable bit), and a `<binary>.stamp` file
+with the build-input, source, and destination fingerprints
 is written to `state_dir` for diagnostics.
 
 ## Running-Binary Rotation
@@ -350,7 +352,9 @@ run in it:
    `--child` the queued process gets), `child_argv` swaps the one for the other,
    and `queue_deploy` re-spawns the same executable detached with that command
    line, stdout and stderr redirected to `<state_dir>/deploy.log` and
-   `<state_dir>/deploy-error.log`, and returns the child pid at once;
+   `<state_dir>/deploy-error.log`, and returns the child pid at once. If the
+   Windows caller is in a job that forbids breakaway, an independent WMI broker
+   starts the child outside the hook job;
 3. the child runs the ordinary plan, so cargo decides whether there is anything
    to build, the rotation is a no-op while the installed binary is already that
    build output, and a real change is built, rotated, verified, and stamped.
@@ -358,6 +362,15 @@ run in it:
 The queued child runs with a console that has no window, and the console
 programs it starts inherit it, so a deploy never puts a console window on the
 screen - not while cargo builds, and not for a plan step that runs a shell.
+
+If Windows rejects `CREATE_BREAKAWAY_FROM_JOB`, the queue creates a short-lived
+WMI broker outside the hook's job instead of falling back to a plain spawn. The
+broker starts the same child with `CreateNoWindow`, preserves both log files,
+and reports the real child pid. The broker and child share a uniquely named
+kill-on-close Windows Job, so a startup timeout cancels the launch token and
+terminates the whole tree. A machine policy that disables local WMI creation
+makes the queue fail explicitly rather than leave a build that will be killed by
+the hook timeout.
 
 On Windows a hook runner with *no* console of its own (a GUI host) makes Windows
 allocate a new, **visible** console for the first console program the hook

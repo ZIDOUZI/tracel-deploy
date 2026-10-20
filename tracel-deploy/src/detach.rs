@@ -4,14 +4,10 @@
 use std::io;
 use std::process::{Child, Command};
 
-/// Starts `command` outside the caller's process tree: no console window, its
-/// own console and process group, and - when the enclosing job allows it - a
-/// breakaway, so a caller that is killed (a hook that hits its timeout, a
-/// closing shell) cannot take the detached child down with it.
-///
-/// Windows: `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`, plus
+/// Starts `command` outside the caller's process tree when the enclosing job
+/// permits breakaway: no console window, its own console and process group, and
 /// `CREATE_BREAKAWAY_FROM_JOB`. A job that forbids breakaway answers
-/// `ERROR_ACCESS_DENIED`; the retry then keeps the plain detachment.
+/// `ERROR_ACCESS_DENIED`.
 ///
 /// `CREATE_NO_WINDOW`, not `DETACHED_PROCESS`: a process with no console at
 /// all makes the *first* console program it starts allocate one, and Windows
@@ -29,20 +25,37 @@ use std::process::{Child, Command};
 /// hook - and everything still in the hook's job - when the hook's timeout
 /// fires: mid-build, with the deployment lock still on disk.
 #[cfg(windows)]
-pub(crate) fn spawn_detached(command: &mut Command) -> io::Result<Child> {
+pub(crate) fn spawn_breakaway(command: &mut Command) -> io::Result<Child> {
     use std::os::windows::process::CommandExt as _;
 
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-    const ERROR_ACCESS_DENIED: i32 = 5;
 
-    // Held across both spawn attempts, so the retry below is covered too.
     let _stdio = StdioInheritGuard::clear();
 
     command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
-    match command.spawn() {
-        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+    command.spawn()
+}
+
+/// Starts a detached child, retrying without `CREATE_BREAKAWAY_FROM_JOB` when
+/// the enclosing job forbids it.
+///
+/// This compatibility fallback is appropriate for service processes. A deploy
+/// queue uses [`spawn_breakaway`] directly and sends the rejected case to a
+/// broker outside the job, because retrying in the job lets a hook timeout
+/// terminate the build.
+#[cfg(windows)]
+#[cfg_attr(not(feature = "service"), allow(dead_code))]
+pub(crate) fn spawn_detached(command: &mut Command) -> io::Result<Child> {
+    use std::os::windows::process::CommandExt as _;
+
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    match spawn_breakaway(command) {
+        Err(error) if breakaway_denied(&error) => {
+            let _stdio = StdioInheritGuard::clear();
             command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
             command.spawn()
         }
@@ -50,9 +63,79 @@ pub(crate) fn spawn_detached(command: &mut Command) -> io::Result<Child> {
     }
 }
 
+/// Whether Windows rejected a child because the enclosing job forbids
+/// breakaway.
+#[cfg(windows)]
+pub(crate) fn breakaway_denied(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(5)
+}
+
+/// Probes whether this process is in a Windows job that rejects an explicit
+/// breakaway. The probe uses a known console executable, so an access-denied
+/// result from the caller's real command cannot be mistaken for a job limit.
+#[cfg(windows)]
+pub(crate) fn job_forbids_breakaway() -> io::Result<bool> {
+    use std::{ffi::c_void, process::Stdio};
+
+    const ERROR_ACCESS_DENIED: i32 = 5;
+
+    #[allow(non_snake_case)]
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn IsProcessInJob(process: *mut c_void, job: *mut c_void, result: *mut i32) -> i32;
+    }
+
+    let mut in_job = 0;
+    let queried = unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) };
+    if queried == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if in_job == 0 {
+        return Ok(false);
+    }
+
+    let system_cmd = std::path::PathBuf::from(
+        std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
+    )
+    .join(r"System32\cmd.exe");
+    let command_processor = if system_cmd.is_file() {
+        system_cmd
+    } else {
+        std::env::var_os("ComSpec")
+            .map(std::path::PathBuf::from)
+            .unwrap_or(system_cmd)
+    };
+    let mut probe = Command::new(command_processor);
+    probe
+        .args(["/D", "/C", "exit 0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match spawn_breakaway(&mut probe) {
+        Ok(mut child) => {
+            let _ = child.wait();
+            Ok(false)
+        }
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 /// On other platforms a detached child is a plain spawn: it inherits no
 /// controlling terminal and is not ended by the parent exiting.
 #[cfg(not(windows))]
+pub(crate) fn spawn_breakaway(command: &mut Command) -> io::Result<Child> {
+    command.spawn()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn breakaway_denied(_error: &io::Error) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+#[cfg_attr(not(feature = "service"), allow(dead_code))]
 pub(crate) fn spawn_detached(command: &mut Command) -> io::Result<Child> {
     command.spawn()
 }

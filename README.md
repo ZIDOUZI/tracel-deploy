@@ -143,11 +143,13 @@ trigger a redeploy. A missing or legacy stamp never skips.
 
 Every non-dry-run deployment takes a lock in `state_dir`
 (`<binary>.deploy.lock`), so two deployments of the same binary cannot rotate it
-concurrently. A lock a killed deployment left behind is taken over once it is
-older than `STALE_LOCK_AFTER` (10 minutes); a fresh one reports the owning pid
-and refuses. After a real rotation the installed binary is verified against the
-source (content hash, size, and - on Unix - the executable bit), and a
-`<binary>.stamp` file with the build-input, source, and destination fingerprints
+concurrently. A lock whose recorded pid is gone is taken over immediately; a
+live owner keeps it regardless of age and refreshes the lock while it works.
+`STALE_LOCK_AFTER` (10 minutes) remains the fallback when the OS cannot
+determine whether the owner is alive and its heartbeat has stopped. After a
+real rotation the installed binary is verified against the source (content
+hash, size, and - on Unix - the executable bit), and a `<binary>.stamp` file
+with the build-input, source, and destination fingerprints
 is written to `state_dir` for diagnostics.
 
 ## Running-Binary Rotation

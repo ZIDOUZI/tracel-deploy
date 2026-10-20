@@ -2,6 +2,8 @@ use std::{
     env, fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
     time::{Duration, SystemTime},
 };
 
@@ -618,25 +620,74 @@ fn relative_input_name(root: &Path, path: &Path) -> String {
 /// How old a lock file must be before [`DeployLock::acquire`] treats it as the
 /// leftovers of a killed deployment and takes it over.
 ///
-/// This is a heuristic, because nothing refreshes the file while a deployment
-/// runs: a build that legitimately takes longer than the threshold can be taken
-/// over. That is safe here - the takeover only decides *who* deploys: cargo
-/// serializes builds of one target directory, and a rotation that finds the
-/// installed binary already equal to the built one is a no-op.
+/// This is only the fallback for locks whose owner cannot be inspected. When
+/// the recorded pid is known to be alive the lock is never taken by age; when
+/// it is known to be gone the lock is taken immediately. A live `DeployLock`
+/// refreshes the file mtime, so an inaccessible but healthy owner remains
+/// fresh.
 pub const STALE_LOCK_AFTER: Duration = Duration::from_secs(600);
+
+#[cfg(test)]
+const LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(20);
+#[cfg(not(test))]
+const LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Refreshes a live deployment lock so an owner whose pid cannot be inspected
+/// is not mistaken for a dead process after [`STALE_LOCK_AFTER`].
+#[derive(Debug)]
+struct LockHeartbeat {
+    stop: Option<mpsc::Sender<()>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl LockHeartbeat {
+    fn start(path: &Path) -> Self {
+        let (stop, wait) = mpsc::channel();
+        let path = path.to_path_buf();
+        let worker = thread::spawn(move || {
+            loop {
+                match wait.recv_timeout(LOCK_HEARTBEAT_INTERVAL) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Ok(file) = fs::OpenOptions::new().write(true).open(&path) {
+                            let _ = file.set_modified(SystemTime::now());
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            stop: Some(stop),
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for LockHeartbeat {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
 
 /// Deployment lock stored inside the context `state_dir`.
 ///
 /// The lock is created with `create_new`, so two deployments of the same binary
 /// cannot rotate it at the same time, and it is removed on drop, including
-/// failure paths. A lock a killed deployment left behind (no `Drop`, no chance
-/// to clean up) is taken over once it is older than [`STALE_LOCK_AFTER`]; a
-/// fresh lock reports the owning pid and refuses.
+/// failure paths. A lock owned by a dead process is taken over immediately. If
+/// the owner cannot be inspected, [`STALE_LOCK_AFTER`] remains the fallback.
+/// Reclaim attempts are serialized by a sidecar marker and recreate the lock
+/// rather than truncating it in place.
 #[derive(Debug)]
 pub struct DeployLock {
     path: PathBuf,
     _file: fs::File,
     took_over: Option<u32>,
+    heartbeat: Option<LockHeartbeat>,
 }
 
 impl DeployLock {
@@ -650,11 +701,19 @@ impl DeployLock {
             .open(&path)
         {
             Ok(mut file) => {
-                let _ = writeln!(file, "pid={}", std::process::id());
+                if let Err(error) = writeln!(file, "pid={}", std::process::id()) {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(error).with_context(|| {
+                        format!("could not write deployment lock {}", path.display())
+                    });
+                }
+                let heartbeat = Some(LockHeartbeat::start(&path));
                 Ok(Self {
                     path,
                     _file: file,
                     took_over: None,
+                    heartbeat,
                 })
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -666,13 +725,27 @@ impl DeployLock {
     }
 
     /// Takes the lock over when the existing one is stale, refuses otherwise.
+    ///
+    /// A sidecar takeover marker serializes reclaim attempts. The main lock is
+    /// removed and recreated with `create_new` instead of being truncated, so a
+    /// contender can never overwrite a fresh lock in place.
     fn take_over_if_stale(path: PathBuf) -> Result<Self> {
+        let _takeover = TakeoverMarker::acquire(&path)?;
         let age = fs::metadata(&path)
             .and_then(|metadata| metadata.modified())
             .ok()
             .and_then(|modified| SystemTime::now().duration_since(modified).ok());
         let owner = lock_owner(&path);
-        if age.is_none_or(|age| age < STALE_LOCK_AFTER) {
+        let owner_alive = owner.and_then(process_is_alive);
+        if owner_alive == Some(true) {
+            let owner = owner.map(|pid| format!(", pid {pid}")).unwrap_or_default();
+            anyhow::bail!(
+                "deployment already running (lock: {}{owner}); its owner process is still alive",
+                path.display()
+            );
+        }
+        let stale = owner_alive == Some(false) || age.is_some_and(|age| age >= STALE_LOCK_AFTER);
+        if !stale {
             let owner = owner.map(|pid| format!(", pid {pid}")).unwrap_or_default();
             anyhow::bail!(
                 "deployment already running (lock: {}{owner}); a lock left behind by a killed \
@@ -681,22 +754,41 @@ impl DeployLock {
                 STALE_LOCK_AFTER.as_secs() / 60
             );
         }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "could not remove the stale deployment lock {}",
+                        path.display()
+                    )
+                });
+            }
+        }
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .truncate(true)
+            .create_new(true)
             .open(&path)
             .with_context(|| {
                 format!(
-                    "could not take over the stale deployment lock {}",
+                    "could not recreate the stale deployment lock {}",
                     path.display()
                 )
             })?;
-        writeln!(file, "pid={}", std::process::id())
-            .with_context(|| format!("could not write the deployment lock {}", path.display()))?;
+        if let Err(error) = writeln!(file, "pid={}", std::process::id()) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(error).with_context(|| {
+                format!("could not write the deployment lock {}", path.display())
+            });
+        }
+        let heartbeat = Some(LockHeartbeat::start(&path));
         Ok(Self {
             path,
             _file: file,
             took_over: owner,
+            heartbeat,
         })
     }
 
@@ -711,6 +803,90 @@ impl DeployLock {
     }
 }
 
+struct TakeoverMarker {
+    path: PathBuf,
+    _file: fs::File,
+}
+
+impl TakeoverMarker {
+    fn acquire(lock_path: &Path) -> Result<Self> {
+        let mut marker_name = lock_path.as_os_str().to_os_string();
+        marker_name.push(".takeover");
+        let path = PathBuf::from(marker_name);
+        for _ in 0..2 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    if let Err(error) = writeln!(file, "pid={}", std::process::id()) {
+                        drop(file);
+                        let _ = fs::remove_file(&path);
+                        return Err(error).with_context(|| {
+                            format!("could not write takeover marker {}", path.display())
+                        });
+                    }
+                    return Ok(Self { path, _file: file });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let age = fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+                    let owner = lock_owner(&path);
+                    let owner_alive = owner.and_then(process_is_alive);
+                    let stale = owner_alive == Some(false)
+                        || (owner_alive != Some(true)
+                            && age.is_some_and(|age| age >= STALE_LOCK_AFTER));
+                    if stale {
+                        match fs::remove_file(&path) {
+                            Ok(()) => continue,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(error) => {
+                                return Err(error).with_context(|| {
+                                    format!(
+                                        "could not remove the stale takeover marker {}",
+                                        path.display()
+                                    )
+                                });
+                            }
+                        }
+                    }
+                    let owner = owner.map(|pid| format!(", pid {pid}")).unwrap_or_default();
+                    anyhow::bail!(
+                        "deployment already running or being reclaimed (takeover marker: \
+                         {}{owner})",
+                        path.display()
+                    );
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("could not create takeover marker {}", path.display())
+                    });
+                }
+            }
+        }
+        anyhow::bail!(
+            "could not acquire the deployment takeover marker {}",
+            path.display()
+        )
+    }
+}
+
+impl Drop for TakeoverMarker {
+    fn drop(&mut self) {
+        for attempt in 0..5 {
+            match fs::remove_file(&self.path) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(_) if attempt < 4 => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 /// The `pid=…` a lock file records, when it parses.
 fn lock_owner(path: &Path) -> Option<u32> {
     let contents = fs::read_to_string(path).ok()?;
@@ -720,8 +896,76 @@ fn lock_owner(path: &Path) -> Option<u32> {
         .and_then(|pid| pid.trim().parse().ok())
 }
 
+/// Whether the process that wrote a lock still exists.
+///
+/// `None` means the OS could not determine it; callers then keep the age-based
+/// fallback.
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> Option<bool> {
+    use std::ffi::c_void;
+
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 258;
+
+    #[allow(non_snake_case)]
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(ERROR_INVALID_PARAMETER) => Some(false),
+            _ => None,
+        };
+    }
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    match wait {
+        WAIT_OBJECT_0 => Some(false),
+        WAIT_TIMEOUT => Some(true),
+        // WAIT_FAILED and unexpected results leave liveness unknown.
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> Option<bool> {
+    if pid == 0 {
+        return Some(false);
+    }
+    let pid = i32::try_from(pid).ok()?;
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    if unsafe { kill(pid, 0) } == 0 {
+        return Some(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(3) => Some(false), // ESRCH: no such process.
+        // EPERM means the process exists but cannot be inspected.
+        _ => None,
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn process_is_alive(_pid: u32) -> Option<bool> {
+    None
+}
+
 impl Drop for DeployLock {
     fn drop(&mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            drop(heartbeat);
+        }
         // Take the lock away only while it still records this process: a
         // deployment that took the stale lock over owns the file from then on,
         // and its own drop removes it.
@@ -759,12 +1003,12 @@ mod tests {
         fs,
         path::PathBuf,
         sync::Mutex,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use super::{
-        DeployContext, binary_name_with_extension, build_inputs_fingerprint,
-        build_inputs_fingerprint_with, content_matches, file_fingerprint,
+        DeployContext, LOCK_HEARTBEAT_INTERVAL, LockHeartbeat, binary_name_with_extension,
+        build_inputs_fingerprint, build_inputs_fingerprint_with, content_matches, file_fingerprint,
     };
 
     /// Serializes the tests that mutate process-wide cargo environment
@@ -908,6 +1152,41 @@ mod tests {
 
         fs::write(&right, "different").expect("right");
         assert!(!content_matches(&left, &right).expect("compare"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lock_heartbeat_refreshes_until_dropped() {
+        let dir = temp_dir("heartbeat");
+        let path = dir.join("test-binary.deploy.lock");
+        fs::write(&path, "pid=1\n").expect("lock file");
+        let before = fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("modified");
+
+        let heartbeat = LockHeartbeat::start(&path);
+        std::thread::sleep(LOCK_HEARTBEAT_INTERVAL * 3);
+        let refreshed = fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("modified");
+        assert!(refreshed > before, "the heartbeat refreshes the lock mtime");
+
+        drop(heartbeat);
+        let stopped = fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("modified");
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("metadata")
+                .modified()
+                .expect("modified"),
+            stopped,
+            "dropping the lock heartbeat stops future refreshes"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

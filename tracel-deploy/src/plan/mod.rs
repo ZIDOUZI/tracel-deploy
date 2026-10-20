@@ -1812,7 +1812,52 @@ mod tests {
     fn a_lock_left_behind_by_a_killed_deployment_is_taken_over() {
         let state_dir = temp_workspace("stale-lock");
         let path = state_dir.join("test-binary.deploy.lock");
-        std::fs::write(&path, "pid=999999\n").expect("stale lock");
+        let dead_pid = exited_process_pid();
+        std::fs::write(&path, format!("pid={dead_pid}\n")).expect("stale lock");
+
+        let lock = crate::context::DeployLock::acquire(&state_dir, "test-binary")
+            .expect("a lock whose owner is gone is taken over immediately");
+        assert_eq!(lock.took_over(), Some(dead_pid));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("lock"),
+            format!("pid={}\n", std::process::id()),
+            "the takeover owns the lock from now on"
+        );
+        drop(lock);
+        assert!(!path.exists(), "the takeover removes the lock it owns");
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn a_lock_owned_by_a_live_process_is_not_taken_over_by_age() {
+        let state_dir = temp_workspace("live-lock");
+        let path = state_dir.join("test-binary.deploy.lock");
+        std::fs::write(&path, format!("pid={}\n", std::process::id())).expect("live lock");
+        let old = std::time::SystemTime::now()
+            - crate::context::STALE_LOCK_AFTER
+            - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open lock")
+            .set_modified(old)
+            .expect("backdate the lock");
+
+        let error = crate::context::DeployLock::acquire(&state_dir, "test-binary")
+            .expect_err("a live owner keeps its lock regardless of age");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("owner process is still alive"),
+            "error: {text}"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn an_uninspectable_lock_still_uses_the_age_threshold() {
+        let state_dir = temp_workspace("unknown-lock");
+        let path = state_dir.join("test-binary.deploy.lock");
+        std::fs::write(&path, "owner unavailable\n").expect("lock without a pid");
         let old = std::time::SystemTime::now()
             - crate::context::STALE_LOCK_AFTER
             - std::time::Duration::from_secs(60);
@@ -1824,15 +1869,36 @@ mod tests {
             .expect("backdate the lock");
 
         let lock = crate::context::DeployLock::acquire(&state_dir, "test-binary")
-            .expect("a stale lock is taken over");
-        assert_eq!(lock.took_over(), Some(999999));
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("lock"),
-            format!("pid={}\n", std::process::id()),
-            "the takeover owns the lock from now on"
-        );
+            .expect("an old lock without an inspectable owner is taken over");
+        assert_eq!(lock.took_over(), None);
         drop(lock);
-        assert!(!path.exists(), "the takeover removes the lock it owns");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn a_takeover_in_progress_blocks_a_second_reclaimer() {
+        let state_dir = temp_workspace("takeover-marker");
+        let path = state_dir.join("test-binary.deploy.lock");
+        let dead_pid = exited_process_pid();
+        std::fs::write(&path, format!("pid={dead_pid}\n")).expect("stale lock");
+        let mut marker = path.as_os_str().to_os_string();
+        marker.push(".takeover");
+        std::fs::write(
+            std::path::PathBuf::from(marker),
+            format!("pid={}\n", std::process::id()),
+        )
+        .expect("live takeover marker");
+
+        let error = crate::context::DeployLock::acquire(&state_dir, "test-binary")
+            .expect_err("only one process may reclaim a stale lock");
+        let text = format!("{error:#}");
+        assert!(text.contains("being reclaimed"), "error: {text}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("original lock"),
+            format!("pid={dead_pid}\n"),
+            "a blocked contender must not modify the lock"
+        );
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
@@ -1936,6 +2002,27 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    fn exited_process_pid() -> u32 {
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/D", "/C", "exit 0"])
+            .spawn()
+            .expect("start a short-lived process");
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("start a short-lived process");
+        #[cfg(not(any(windows, unix)))]
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("start a short-lived process");
+
+        let pid = child.id();
+        child.wait().expect("wait for the short-lived process");
+        pid
     }
 
     /// How many `<binary>.old-*` backups a rotation left in `dir`.

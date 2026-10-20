@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.5
+
+### Background deploys escape restrictive Windows hook jobs
+
+- When Windows rejects `CREATE_BREAKAWAY_FROM_JOB`, the deploy queue now starts
+  the child through a short-lived WMI broker outside the caller's job instead of
+  retrying a plain spawn inside it. The broker keeps `deploy.log` /
+  `deploy-error.log`, starts the real child with `CreateNoWindow`, and returns
+  the real child pid, so a Codex hook timeout can no longer terminate an active
+  build while leaving `.deploy.lock` behind.
+- A broker that misses the startup deadline is cancelled through a launch token,
+  bound to a uniquely named kill-on-close Windows Job, and terminated through
+  that Job while its exact process handle is still held. Temporary files are
+  removed with bounded retries. If Job termination fails, the queue reports a
+  distinct non-retryable error instead of allowing a late broker or child to
+  launch duplicate work.
+- Regression coverage assigns a queueing helper to a restrictive Windows Job,
+  terminates that Job, and verifies that the queued child survives, writes its
+  log, stays windowless, and receives arguments containing spaces, quotes, and
+  backslashes verbatim.
+
+### Dead deployment locks are reclaimed immediately
+
+- `DeployLock::acquire` now checks the recorded owner pid. A dead owner is taken
+  over immediately; a live owner keeps the lock even after
+  `STALE_LOCK_AFTER`. A live lock refreshes its mtime, protecting healthy owners
+  whose pid cannot be inspected. The ten-minute threshold remains only when
+  liveness is unknown and the heartbeat has stopped. A sidecar takeover marker
+  serializes reclaim attempts, which recreate the lock with `create_new`
+  instead of truncating a file another process may now own.
+
 ## 0.4.4
 
 ### Revert the `conhost.exe --headless` hook wrapper shipped in 0.4.3

@@ -11,6 +11,8 @@
 //!    child nor the programs it starts (cargo, a plan's shell) can put one on
 //!    the screen - redirecting stdout to `<state_dir>/deploy.log` and stderr to
 //!    `<state_dir>/deploy-error.log`, and returns the child's pid at once.
+//!    If a Windows hook job forbids breakaway, the queue starts the child
+//!    through an independent WMI broker instead of retrying inside that job.
 //! 3. The child runs the ordinary plan: cargo decides whether there is anything
 //!    to build, the rotation is a no-op while the installed binary is already
 //!    that build output, and a real change is rotated, verified, and stamped.
@@ -54,10 +56,13 @@ use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
 };
 
 use anyhow::{Context as _, Result};
+
+#[cfg(windows)]
+mod windows;
 
 /// File a queued run writes its stdout to, inside the state directory.
 pub const DEPLOY_LOG: &str = "deploy.log";
@@ -171,25 +176,37 @@ pub fn queue_deploy(
 /// [`queue_deploy`] with an explicit executable, for callers that queue
 /// something other than themselves (and for tests). `argv` is passed through
 /// verbatim, exactly like [`queue_deploy`].
+///
+/// On Windows, a job that rejects `CREATE_BREAKAWAY_FROM_JOB` sends the launch
+/// through a WMI-created broker outside the caller's job. The broker keeps the
+/// normal log files and reports the real deployment child's pid.
 pub fn queue_executable(
     executable: &Path,
     state_dir: &Path,
     working_dir: Option<&Path>,
     argv: impl IntoIterator<Item = OsString>,
 ) -> Result<u32> {
+    let argv: Vec<OsString> = argv.into_iter().collect();
     let logs = DeploymentLogs::open(state_dir)?;
     let mut command = Command::new(executable);
     command
-        .args(argv)
+        .args(&argv)
         .stdin(Stdio::null())
         .stdout(logs.stdout)
         .stderr(logs.stderr);
     if let Some(working_dir) = working_dir {
         command.current_dir(working_dir);
     }
-    let child: Child = crate::detach::spawn_detached(&mut command)
-        .with_context(|| format!("queue {}", executable.display()))?;
-    Ok(child.id())
+    #[cfg(windows)]
+    if crate::detach::job_forbids_breakaway().context("probe Windows job breakaway support")? {
+        drop(command);
+        return windows::queue_outside_job(executable, state_dir, working_dir, &argv)
+            .with_context(|| format!("queue {} outside the hook job", executable.display()));
+    }
+    match crate::detach::spawn_breakaway(&mut command) {
+        Ok(child) => Ok(child.id()),
+        Err(error) => Err(error).with_context(|| format!("queue {}", executable.display())),
+    }
 }
 
 /// The command line a Codex `Stop` hook runs: `deploy --background` through
@@ -359,6 +376,19 @@ mod tests {
     /// held the helper's stdout cannot let the pipe close inside the deadline.
     #[cfg(windows)]
     const PIPE_HOLDING_SECS: u64 = 30;
+    #[cfg(windows)]
+    const RESTRICTIVE_JOB_QUEUE_HELPER: &str =
+        "background::tests::queue_inside_restrictive_job_helper";
+    #[cfg(windows)]
+    const RESTRICTIVE_JOB_CHILD_HELPER: &str =
+        "background::tests::child_inside_restrictive_job_helper";
+    #[cfg(windows)]
+    const RESTRICTIVE_JOB_RELEASE_ENV: &str = "TRACEL_DEPLOY_TEST_RESTRICTIVE_JOB_RELEASE";
+    #[cfg(windows)]
+    const RESTRICTIVE_JOB_STATE_ENV: &str = "TRACEL_DEPLOY_TEST_RESTRICTIVE_JOB_STATE";
+    #[cfg(windows)]
+    const RESTRICTIVE_JOB_MARKER: &str =
+        r#"argument with spaces, "quotes", and C:\path with space\"#;
 
     /// Windows: what console this process runs with.
     #[cfg(windows)]
@@ -386,6 +416,108 @@ mod tests {
             }
             let visible = unsafe { IsWindowVisible(hwnd) } != 0;
             format!("console=1 visible={}", u8::from(visible))
+        }
+    }
+
+    #[cfg(windows)]
+    mod job {
+        use std::{ffi::c_void, io, os::windows::io::AsRawHandle as _, process::Child};
+
+        const PROCESS_TERMINATE: u32 = 0x0001;
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const WAIT_TIMEOUT: u32 = 258;
+
+        #[allow(non_snake_case)]
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> *mut c_void;
+            fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+            fn IsProcessInJob(process: *mut c_void, job: *mut c_void, result: *mut i32) -> i32;
+            fn TerminateJobObject(job: *mut c_void, code: u32) -> i32;
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            fn TerminateProcess(process: *mut c_void, code: u32) -> i32;
+            fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+
+        pub(super) struct Job(*mut c_void);
+
+        impl Job {
+            pub(super) fn create() -> io::Result<Self> {
+                let handle = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+                if handle.is_null() {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(Self(handle))
+                }
+            }
+
+            pub(super) fn assign(&self, child: &Child) -> io::Result<()> {
+                let assigned =
+                    unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle().cast()) };
+                if assigned == 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            }
+
+            pub(super) fn contains(&self, pid: u32) -> io::Result<bool> {
+                let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+                if process.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                let mut result = 0;
+                let queried = unsafe { IsProcessInJob(process, self.0, &mut result) };
+                unsafe {
+                    CloseHandle(process);
+                }
+                if queried == 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(result != 0)
+                }
+            }
+
+            pub(super) fn terminate(&self) -> io::Result<()> {
+                if unsafe { TerminateJobObject(self.0, 1) } == 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        impl Drop for Job {
+            fn drop(&mut self) {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+
+        pub(super) fn is_alive(pid: u32) -> bool {
+            let process = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+            if process.is_null() {
+                return false;
+            }
+            let alive = unsafe { WaitForSingleObject(process, 0) } == WAIT_TIMEOUT;
+            unsafe {
+                CloseHandle(process);
+            }
+            alive
+        }
+
+        pub(super) fn terminate_process(pid: u32) {
+            let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+            if process.is_null() {
+                return;
+            }
+            unsafe {
+                TerminateProcess(process, 1);
+                CloseHandle(process);
+            }
         }
     }
 
@@ -434,6 +566,49 @@ mod tests {
             .map(OsString::from)
             .to_vec();
         let pid = queue_executable(&executable, &dir, None, argv).expect("queue the child");
+        println!("queued-pid={pid}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper for a_queued_child_escapes_a_job_that_forbids_breakaway"]
+    fn child_inside_restrictive_job_helper() {
+        assert!(
+            env::args_os().any(|argument| argument == RESTRICTIVE_JOB_MARKER),
+            "the WMI broker must preserve an argument containing spaces, quotes, and backslashes"
+        );
+        println!("restrictive-job-child-console={}", console::report());
+        std::thread::sleep(Duration::from_secs(3));
+        println!("restrictive-job-child-survived");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper for a_queued_child_escapes_a_job_that_forbids_breakaway"]
+    fn queue_inside_restrictive_job_helper() {
+        let release = env::var_os(RESTRICTIVE_JOB_RELEASE_ENV).expect("release path");
+        let state_dir = PathBuf::from(env::var_os(RESTRICTIVE_JOB_STATE_ENV).expect("state dir"));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !Path::new(&release).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the parent never released the restrictive-job helper"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let executable = env::current_exe().expect("locate the test binary");
+        let argv = [
+            "--exact",
+            RESTRICTIVE_JOB_CHILD_HELPER,
+            "--ignored",
+            "--nocapture",
+            "--",
+            RESTRICTIVE_JOB_MARKER,
+        ]
+        .map(OsString::from)
+        .to_vec();
+        let pid = queue_executable(&executable, &state_dir, None, argv).expect("queue the child");
         println!("queued-pid={pid}");
     }
 
@@ -594,6 +769,100 @@ mod tests {
             "the queued child must not hold the helper's stdout: EOF came only after \
              {waited:?} (the child lives {PIPE_HOLDING_SECS}s)"
         );
+    }
+
+    /// Windows: a restrictive outer job rejects `CREATE_BREAKAWAY_FROM_JOB`.
+    /// The queued deployment must therefore be started by the independent WMI
+    /// broker, not by retrying a plain spawn inside that job.
+    #[cfg(windows)]
+    #[test]
+    fn a_queued_child_escapes_a_job_that_forbids_breakaway() {
+        let dir = temp_dir("restrictive-job");
+        let release = dir.join("release");
+        let state_dir = dir.join("state");
+        let executable = env::current_exe().expect("locate the test binary");
+        let job = job::Job::create().expect("create restrictive job");
+        let helper = Command::new(executable)
+            .args([
+                "--exact",
+                RESTRICTIVE_JOB_QUEUE_HELPER,
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(RESTRICTIVE_JOB_RELEASE_ENV, &release)
+            .env(RESTRICTIVE_JOB_STATE_ENV, &state_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the restrictive-job helper");
+
+        job.assign(&helper)
+            .expect("assign the helper to the restrictive job");
+        fs::write(&release, "go").expect("release the helper");
+        let output = helper.wait_with_output().expect("wait for the helper");
+        assert!(
+            output.status.success(),
+            "helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let pid = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("queued-pid="))
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+            .expect("the helper reports the queued pid");
+
+        struct KillOnDrop {
+            pid: u32,
+            armed: bool,
+        }
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                if self.armed {
+                    job::terminate_process(self.pid);
+                }
+            }
+        }
+        let mut kill = KillOnDrop { pid, armed: true };
+        assert!(job::is_alive(pid), "the queued child starts alive");
+        assert!(
+            !job.contains(pid).expect("query the restrictive job"),
+            "the queued child must not remain in the hook's job"
+        );
+
+        job.terminate().expect("terminate the restrictive job");
+        let log = wait_for_log(
+            &state_dir.join(DEPLOY_LOG),
+            "restrictive-job-child-survived",
+        );
+        assert!(log.contains("restrictive-job-child-survived"), "{log}");
+        assert!(
+            log.contains("restrictive-job-child-console=console=0 visible=0"),
+            "the WMI broker must keep the deploy child windowless: {log}"
+        );
+        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let leftovers = fs::read_dir(&state_dir)
+                .expect("read the queue state directory")
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    name.to_string_lossy().ends_with(".ps1")
+                        || name.to_string_lossy().ends_with(".pid")
+                        || name.to_string_lossy().ends_with(".launch")
+                })
+                .count();
+            if leftovers == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < cleanup_deadline,
+                "the WMI broker left {leftovers} temporary queue files behind"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        kill.armed = false;
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
